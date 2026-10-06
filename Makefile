@@ -15,6 +15,9 @@ PORT    ?= 8080
 # that opens the page. Setting ARGS (e.g. ARGS="1680 1050") pins the size and
 # disables auto-fit.
 ARGS    ?=
+# audio: 1 = stream the Mac's system sound with the video (default), 0 = silent
+AUDIO   ?= 1
+export HOPPSCREEN_AUDIO = $(AUDIO)
 
 .DEFAULT_GOAL := help
 .PHONY: help run start stop restart status log build
@@ -28,7 +31,7 @@ help:
 	@echo "  status     running? pid, uptime, /status json, recent log"
 	@echo "  log        follow the server log (ctrl-c to leave)"
 	@echo "  build      compile only (run/start do this automatically)"
-	@echo "  vars:      ARGS=\"1680 1050\" pins the display size (PORT=8080 for the probe)"
+	@echo "  vars:      ARGS=\"1680 1050\" pins the display size  AUDIO=0 mutes the stream  PORT=8080 (probe)"
 
 # staleness (missing binary / newer sources) is make's own dependency check
 $(BIN): server.m virtualdisplay.m virtualdisplay.h

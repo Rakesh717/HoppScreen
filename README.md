@@ -12,7 +12,8 @@ the receiver's browser (WebCodecs) over the LAN, with password protection.
    -> VideoToolbox H.264 (hardware, High@5.2, ~28Mbps cap, no B-frames, IDR on demand)
    -> HTTP :8080
         /            player page (WebCodecs H.264, MJPEG fallback, fullscreen+wakelock)
-        /h264        [4B len][JSON cfg] then [4B len][1B flags][8B capture µs][AVCC AU]...
+        /h264        [4B len][JSON cfg] then [4B len][1B flags][8B capture µs][payload]...
+                     flags: bit0=keyframe, bit1=repeat, bit2=audio (SInt16 stereo PCM)
         /time        server clock (latency measurement)
         /stream.mjpg MJPEG multipart (fallback)
         /frame.jpg   single JPEG (debug)
@@ -79,6 +80,23 @@ about 24fps and laggy. The server also serves **HTTPS on port+363 (8443)**:
 - TLS is macOS SecureTransport (TLS 1.2, ECDSA P-256 / AES-GCM). It adds no noticeable latency.
 
 The server log shows `[client] mode=h264&secure=1` when the sharp path is active.
+
+## Audio
+
+System sound is streamed with the video: ScreenCaptureKit taps the Mac's audio,
+and the page plays it through an AudioWorklet — same `/h264` connection, shared
+timestamps. No codec (raw SInt16 stereo, ~1.5 Mbps) keeps latency low and the
+pipeline codec-free.
+
+- Starts with the first tap on the page (browser autoplay rules) — audio context
+  resumes together with fullscreen.
+- ~100 ms prebuffer; underruns play silence, backlog over ~300 ms is dropped.
+- `make start AUDIO=0` disables the audio track (env: `HOPPSCREEN_AUDIO=0`);
+  `/status` reports `"audio":false` either way.
+- Audio exists only on the ScreenCaptureKit capture path — if the server falls
+  back to CGDisplayStream/polling, the stream is silent.
+- A/V sync: audio records carry wall-clock µs on the same clock as video frames;
+  the current page plays continuously and does not yet drift-lock to video.
 
 ## Password (login)
 

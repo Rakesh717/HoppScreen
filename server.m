@@ -70,17 +70,20 @@ static volatile int g_mjpegClients = 0, g_h264Clients = 0;
 static NSData *g_jpeg = nil;
 static uint64_t g_jpegSeq = 0;
 
-// H.264 ring of AVCC access units
+// H.264 ring of AVCC access units (+ audio records)
 typedef struct {
     uint64_t seq;
+    uint64_t vseq;         // video-only sequence (audio records carry the current one)
     BOOL isKey;
     BOOL isRepeat;         // re-submitted unchanged frame (decoder flush / refinement)
+    BOOL isAudio;          // payload = interleaved SInt16 stereo PCM (see "audio")
     int64_t ptsUs;
     NSData *data;          // AVCC (4-byte NALU length prefixes), no SPS/PPS in-band
 } AURec;
 #define AU_RING 512
 static AURec g_au[AU_RING];
 static uint64_t g_auHead = 0;          // last written seq (0 = none yet)
+static uint64_t g_auVideoHead = 0;     // vseq of the last VIDEO record
 static NSString *g_avcCB64 = nil;      // base64 avcC description
 static volatile uint64_t g_h264Bytes = 0;
 static volatile uint64_t g_encOutFrames = 0;   // AUs emitted by encoder callback
@@ -394,7 +397,8 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
     pthread_mutex_lock(&g_lock);
     uint64_t seq = g_auHead + 1;
     AURec *slot = &g_au[seq % AU_RING];
-    slot->seq = seq; slot->isKey = isKey; slot->isRepeat = (srcRefCon != NULL);
+    slot->seq = seq; slot->vseq = ++g_auVideoHead;
+    slot->isKey = isKey; slot->isRepeat = (srcRefCon != NULL); slot->isAudio = NO;
     slot->ptsUs = ptsUs; slot->data = data;
     g_auHead = seq;
     g_h264Bytes += len;
@@ -428,6 +432,109 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
     }
     pthread_cond_broadcast(&g_auCond);
     pthread_mutex_unlock(&g_lock);
+}
+
+// ============================================================ audio (system sound -> ring)
+// ScreenCaptureKit taps the system audio and delivers CMSampleBuffers on
+// g_audioQ. We flatten them (planar or interleaved Float32, any channel count)
+// to interleaved SInt16 stereo at g_audioRate and push them into the same AU
+// ring the video uses — the /h264 stream muxes them out in order, so a client
+// can sync A/V against the shared wall-clock timestamps. Bandwidth ~1.5 Mbps
+// raw PCM; HOPPSCREEN_AUDIO=0 turns it off. Only the SCK capture path has
+// audio (the CGDisplayStream/polling fallbacks stay silent).
+static dispatch_queue_t g_audioQ = NULL;
+static volatile uint32_t g_audioRate = 48000;   // announced in the /h264 cfg
+static volatile BOOL g_audioWanted = NO;        // env: not HOPPSCREEN_AUDIO=0
+static volatile BOOL g_audioFailed = NO;
+
+static void pushAudio(int64_t ptsUs, NSData *pcm) {
+    pthread_mutex_lock(&g_lock);
+    uint64_t seq = g_auHead + 1;
+    AURec *slot = &g_au[seq % AU_RING];
+    slot->seq = seq; slot->vseq = g_auVideoHead;      // lag accounting stays video-only
+    slot->isKey = NO; slot->isRepeat = NO; slot->isAudio = YES;
+    slot->ptsUs = ptsUs; slot->data = pcm;
+    g_auHead = seq;
+    pthread_cond_broadcast(&g_auCond);
+    pthread_mutex_unlock(&g_lock);
+}
+
+static float clampf(float v) { return v < -1 ? -1 : (v > 1 ? 1 : v); }
+
+// one LPCM sample -> float, honoring the ASBD's bit depth
+static float readPCM(const uint8_t *p, BOOL isFloat, UInt32 bits) {
+    if (isFloat && bits == 32) { float f; memcpy(&f, p, 4); return f; }
+    if (isFloat && bits == 64) { double d; memcpy(&d, p, 8); return (float)d; }
+    if (bits == 16) { int16_t v; memcpy(&v, p, 2); return v / 32768.0f; }
+    if (bits == 32) { int32_t v; memcpy(&v, p, 4); return v / 2147483648.0f; }
+    return 0;
+}
+
+static void processAudioSample(CMSampleBufferRef sb) {
+    if (g_audioFailed || !CMSampleBufferIsValid(sb)) return;
+    const AudioStreamBasicDescription *asbd =
+        CMAudioFormatDescriptionGetStreamBasicDescription((CMAudioFormatDescriptionRef)CMSampleBufferGetFormatDescription(sb));
+    UInt32 frames = CMSampleBufferGetNumSamples(sb);
+    if (!asbd || !frames) return;
+    // SCK delivers interleaved LPCM in the sample buffer's CMBlockBuffer
+    // (the AudioBufferList accessor rejects it with -12737, so read raw bytes
+    // and interpret per the ASBD: Int16/Float32, planar or interleaved)
+    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+    size_t len = bb ? CMBlockBufferGetDataLength(bb) : 0;
+    if (!bb || !len) {
+        if (!g_audioFailed) fprintf(stderr, "[audio] no PCM data in sample buffer — audio off\n");
+        g_audioFailed = YES;
+        return;
+    }
+    uint8_t *raw = malloc(len);
+    if (!raw || CMBlockBufferCopyDataBytes(bb, 0, len, raw) != kCMBlockBufferNoErr) { free(raw); return; }
+    UInt32 ch = asbd->mChannelsPerFrame > 0 ? asbd->mChannelsPerFrame : 2;
+    UInt32 bits = asbd->mBitsPerChannel ? asbd->mBitsPerChannel : 16;
+    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    BOOL planar = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    UInt32 bpf = asbd->mBytesPerFrame ? asbd->mBytesPerFrame : ch * ((bits + 7) / 8);
+    UInt32 bps = (bits + 7) / 8;
+    if (len < frames * (planar ? bps : bpf)) { free(raw); return; }
+    float *in = malloc(frames * 2 * sizeof(float));
+    for (UInt32 i = 0; i < frames; i++) {
+        float l, r;
+        if (planar) {                       // plane 0 (all frames), then plane 1
+            l = readPCM(raw + (size_t)i * bps, isFloat, bits);
+            r = ch >= 2 ? readPCM(raw + (size_t)(frames + i) * bps, isFloat, bits) : l;
+        } else {                            // interleaved frames
+            l = readPCM(raw + (size_t)i * bpf, isFloat, bits);
+            r = ch >= 2 ? readPCM(raw + (size_t)i * bpf + bps, isFloat, bits) : l;
+        }
+        in[i * 2] = clampf(l); in[i * 2 + 1] = clampf(r);
+    }
+    free(raw);
+    // resample to the announced rate if SCK delivered something else (linear)
+    double rate = asbd->mSampleRate > 0 ? asbd->mSampleRate : (double)g_audioRate;
+    if ((uint32_t)rate != g_audioRate && getenv("HOPPSCREEN_DEBUG"))
+        fprintf(stderr, "[audio] src rate %.0f -> %u\n", rate, g_audioRate);
+    UInt32 outFrames = (UInt32)((double)frames * (double)g_audioRate / rate);
+    if (outFrames < 1) outFrames = 1;
+    NSMutableData *pcm = [NSMutableData dataWithLength:outFrames * 2 * sizeof(int16_t)];
+    int16_t *dst = (int16_t *)pcm.mutableBytes;
+    double step = (double)frames / outFrames;
+    for (UInt32 i = 0; i < outFrames; i++) {
+        double pos = i * step;
+        UInt32 i0 = (UInt32)pos;
+        float f = (float)(pos - i0);
+        UInt32 i1 = i0 + 1 < frames ? i0 + 1 : i0;
+        dst[i * 2]     = (int16_t)((in[i0 * 2]     + (in[i1 * 2]     - in[i0 * 2])     * f) * 32767);
+        dst[i * 2 + 1] = (int16_t)((in[i0 * 2 + 1] + (in[i1 * 2 + 1] - in[i0 * 2 + 1]) * f) * 32767);
+    }
+    free(in);
+    // PTS is host time — same clock the video encoder uses -> shared wall µs
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+    int64_t ptsUs = CMTIME_IS_VALID(pts)
+        ? realtimeUsFromUptimeUs((int64_t)(CMTimeGetSeconds(pts) * 1e6))
+        : (int64_t)(clock_gettime_nsec_np(CLOCK_REALTIME) / 1000);
+    static int said = 0;
+    if (!said++) fprintf(stderr, "[audio] flowing: %.0f Hz, %u ch, %u-frame chunks\n",
+                         rate, ch, (unsigned)frames);
+    pushAudio(ptsUs, pcm);
 }
 
 static uint64_t nowNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -577,6 +684,10 @@ static volatile int g_scFailed = 0;            // set by the delegate when SCK s
 }
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sb ofType:(SCStreamOutputType)type {
     (void)stream;
+    if (type == SCStreamOutputTypeAudio) {              // system sound -> AU ring
+        processAudioSample(sb);
+        return;
+    }
     if (type != SCStreamOutputTypeScreen) return;
     g_scCallbacks++;
     if (!CMSampleBufferIsValid(sb)) return;
@@ -686,6 +797,11 @@ static BOOL startSCCapture(void) {
         cfg.showsCursor = YES;                            // WindowServer composites the real cursor
         cfg.scalesToFit = NO;
         cfg.colorSpaceName = kCGColorSpaceSRGB;
+        if (g_audioWanted && !g_audioFailed) {            // system audio -> PCM records
+            cfg.capturesAudio = YES;
+            cfg.sampleRate = (NSInteger)g_audioRate;
+            cfg.channelCount = 2;
+        }
 
         g_scOut = [SCOut new];                            // strong ref: SCStream holds outputs weakly
         SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:g_scOut];
@@ -695,6 +811,13 @@ static BOOL startSCCapture(void) {
                                 error:&err]) {
             fprintf(stderr, "[sc] addStreamOutput failed: %s\n", err.localizedDescription.UTF8String ?: "?");
             return NO;
+        }
+        if (g_audioWanted && !g_audioFailed &&
+            ![stream addStreamOutput:g_scOut type:SCStreamOutputTypeAudio
+                       sampleHandlerQueue:g_audioQ error:&err]) {
+            fprintf(stderr, "[audio] output registration failed: %s — audio off\n",
+                    err.localizedDescription.UTF8String ?: "?");
+            g_audioFailed = YES;                          // capture continues, silent
         }
         __block BOOL ok = YES;
         dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
@@ -1196,6 +1319,38 @@ static const char *INDEX_HTML =
 " have(){return this.n-this.o;}\n"
 " u32(i){const b=this.b,o=this.o+i;return ((b[o]<<24)>>>0)+(b[o+1]<<16)+(b[o+2]<<8)+b[o+3];}\n"
 " take(k){const r=this.b.slice(this.o,this.o+k);this.o+=k;if(this.o===this.n){this.o=this.n=0;}return r;}}\n"
+"// audio: system sound arrives as SInt16 records (flag 4) -> AudioWorklet ring.\n"
+"// The context resumes on the first tap (autoplay policy); ~100ms prebuffer.\n"
+"let aCtx=null,aNode=null,aPend=[],aGo=false,aQueued=0;\n"
+"function audioInit(rate){\n"
+" try{\n"
+"  aCtx=new AudioContext({latencyHint:'interactive',sampleRate:rate});\n"
+"  const src='class H extends AudioWorkletProcessor{constructor(){super();this.q=[];this.ri=0;this.go=false;'+\n"
+"   'this.port.onmessage=e=>{if(e.data===\\'go\\')this.go=true;else this.q.push(e.data)};};'+\n"
+"   'process(_,o){const L=o[0][0],R=o[0][1];if(!this.go)return true;'+\n"
+"   'for(let i=0;i<L.length;i++){while(this.q.length&&this.ri*2>=this.q[0].length){this.q.shift();this.ri=0;}'+\n"
+"   'const b=this.q[0];if(!b){L[i]=0;R[i]=0;}else{L[i]=b[this.ri*2];R[i]=b[this.ri*2+1];this.ri++;}}'+\n"
+"   'if(this.q.length>16){this.q.length=0;this.ri=0;}return true;}}'+\n"
+"   'registerProcessor(\\'h\\',H);';\n"
+"  const url=URL.createObjectURL(new Blob([src],{type:'application/javascript'}));\n"
+"  aCtx.audioWorklet.addModule(url).then(()=>{\n"
+"   aNode=new AudioWorkletNode(aCtx,'h',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2]});\n"
+"   aNode.connect(aCtx.destination);\n"
+"   aCtx.resume().catch(()=>{});\n"
+"  }).catch(()=>{});\n"
+" }catch(e){}\n"
+"}\n"
+"function audioFeed(i16){\n"
+" if(!aCtx||!aNode)return;\n"
+" const f=new Float32Array(i16.length);\n"
+" for(let i=0;i<i16.length;i++)f[i]=i16[i]/32768;\n"
+" if(!aGo){aPend.push(f);aQueued+=f.length/2;\n"
+"  if(aQueued>=aCtx.sampleRate*0.1){\n"
+"   for(const b of aPend)aNode.port.postMessage(b);\n"
+"   aPend.length=0;aGo=true;aNode.port.postMessage('go');}\n"
+"  return;}\n"
+" aNode.port.postMessage(f);\n"
+"}\n"
 "async function startH264(){\n"
 " const res=await fetch('/h264',{cache:'no-store'});\n"
 " if(res.status===401){location.reload();throw new Error('401');}   // login lost: 401 on / re-prompts\n"
@@ -1214,10 +1369,12 @@ static const char *INDEX_HTML =
 "    const c={codec:cfg.codec,description:b64u8(cfg.desc),optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'};\n"
 "    try{if(!(await VideoDecoder.isConfigSupported(c)).supported)delete c.hardwareAcceleration;}catch(e){delete c.hardwareAcceleration;}\n"
 "    dec.configure(c);cv.style.display='block';img.style.display='none';\n"
-"    cvInfo=info=cfg.w+'x'+cfg.h+' '+cfg.codec;report();\n"
+"    cvInfo=info=cfg.w+'x'+cfg.h+' '+cfg.codec+(cfg.arate?' +audio':'');report();\n"
+"    if(cfg.arate)audioInit(cfg.arate);\n"
 "   }\n"
 "   while(buf.have()>=13){const L=buf.u32(0);if(buf.have()<13+L)break;\n"
 "    const fl=buf.b[buf.o+4],ts=buf.u32(5)*4294967296+buf.u32(9);buf.take(13);const data=buf.take(L);\n"
+"    if(fl&4){if(L>3)audioFeed(new Int16Array(data.buffer,data.byteOffset,L>>1));continue;}\n"
 "    if(fl&2)rep.add(ts);else latA.push(srvNow()-ts/1000);\n"
 "    if(L>0&&dec.state==='configured')dec.decode(new EncodedVideoChunk({type:(fl&1)?'key':'delta',timestamp:ts,data}));\n"
 "   }\n"
@@ -1251,6 +1408,7 @@ static const char *INDEX_HTML =
 "let armed=false;\n"
 "document.addEventListener('click',async()=>{\n"
 " if(!armed){armed=true;ui.remove();await goFull();\n"
+"  if(aCtx&&aCtx.state!=='running')aCtx.resume().catch(()=>{});\n"
 "  wv.src='/silent.mp4';wv.volume=0;await wv.play().catch(()=>{});keepAwake();setInterval(keepAwake,5000);return;}\n"
 " if(!document.fullscreenElement)goFull();else{showStats=!showStats;draw();}\n"
 "});\n"
@@ -1485,9 +1643,10 @@ static void handleClient(int fd, BOOL tls) {
                 writeStr(fd, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
                 __sync_fetch_and_sub(&g_h264Clients, 1); closeConn(fd); return;
             }
+            BOOL audio = g_audioWanted && !g_audioFailed;
             NSString *cfg = [NSString stringWithFormat:
-                @"{\"codec\":\"%@\",\"desc\":\"%@\",\"w\":%u,\"h\":%u,\"fps\":%.0f}",
-                codec, desc, g_pixW, g_pixH, g_fps];
+                @"{\"codec\":\"%@\",\"desc\":\"%@\",\"w\":%u,\"h\":%u,\"fps\":%.0f,\"arate\":%u,\"ach\":2}",
+                codec, desc, g_pixW, g_pixH, g_fps, audio ? (unsigned)g_audioRate : 0];
             NSData *cfgData = [cfg dataUsingEncoding:NSUTF8StringEncoding];
             uint8_t cl[4] = {(uint8_t)(cfgData.length >> 24), (uint8_t)(cfgData.length >> 16),
                              (uint8_t)(cfgData.length >> 8), (uint8_t)cfgData.length};
@@ -1507,7 +1666,7 @@ static void handleClient(int fd, BOOL tls) {
             const uint64_t MAX_LAG = (uint64_t)(g_fps / 4) + 2;   // ~250ms of frames
             uint64_t waitAfter;
             pthread_mutex_lock(&g_lock); waitAfter = g_auHead; pthread_mutex_unlock(&g_lock);
-            uint64_t lastSent = 0;
+            uint64_t lastSent = 0, lastSentV = 0;             // V = video-only sequence
             BOOL primed = NO;
             int sent = 0, resyncs = 0;
             NSData *out[64]; uint8_t fl[64]; int64_t tss[64];
@@ -1518,19 +1677,26 @@ static void handleClient(int fd, BOOL tls) {
                     if (!primed) {
                         for (uint64_t s = waitAfter + 1; s <= g_auHead; s++) {
                             AURec *r = &g_au[s % AU_RING];
-                            if (r->seq == s && r->isKey) { lastSent = s - 1; primed = YES; break; }
+                            if (r->seq == s && r->isKey && !r->isAudio) {
+                                lastSent = s - 1; lastSentV = g_auVideoHead; primed = YES; break;
+                            }
                         }
                         if (!primed) waitAfter = g_auHead;
                     }
                     if (primed) {
-                        if (g_auHead - lastSent > MAX_LAG) {        // too far behind: resync
-                            primed = NO; waitAfter = g_auHead; g_forceKey = 1; resyncs++;
+                        if (g_auVideoHead - lastSentV > MAX_LAG) {   // video too far behind: resync
+                            primed = NO; waitAfter = g_auHead; lastSentV = g_auVideoHead;
+                            g_forceKey = 1; resyncs++;
                         } else {
                             for (uint64_t s = lastSent + 1; s <= g_auHead && cnt < 64; s++) {
                                 AURec *r = &g_au[s % AU_RING];
                                 if (r->seq != s) continue;
-                                out[cnt] = r->data; fl[cnt] = (r->isKey ? 1 : 0) | (r->isRepeat ? 2 : 0); tss[cnt] = r->ptsUs; cnt++;
+                                out[cnt] = r->data;
+                                fl[cnt] = (uint8_t)((r->isKey ? 1 : 0) | (r->isRepeat ? 2 : 0) |
+                                                    (r->isAudio ? 4 : 0));
+                                tss[cnt] = r->ptsUs; cnt++;
                                 lastSent = s;
+                                if (!r->isAudio) lastSentV = r->vseq;
                             }
                         }
                     }
@@ -1557,12 +1723,12 @@ static void handleClient(int fd, BOOL tls) {
             NSString *b = [NSString stringWithFormat:
                 @"{\"display\":%u,\"width\":%u,\"height\":%u,\"pixel_width\":%u,\"pixel_height\":%u,"
                 @"\"capture\":\"%s\",\"capture_fps\":%.1f,\"encode_fps\":%.1f,"
-                @"\"tls_port\":%u,\"sc_callbacks\":%llu,\"h264_total_kbits\":%llu,\"mjpeg_clients\":%d,\"h264_clients\":%d,\"h264\":%@}",
+                @"\"tls_port\":%u,\"sc_callbacks\":%llu,\"h264_total_kbits\":%llu,\"mjpeg_clients\":%d,\"h264_clients\":%d,\"h264\":%@,\"audio\":%@}",
                 g_displayID, g_dispW, g_dispH, g_pixW, g_pixH,
                 g_scStream ? "screencapturekit" : (g_cgStream ? "cgdisplaystream" : "polling"),
                 g_captureFps, g_encFps, (unsigned)g_tlsPort, (unsigned long long)g_scCallbacks,
                 (unsigned long long)(g_h264Bytes * 8 / 1000), g_mjpegClients, g_h264Clients,
-                g_vts ? @"true" : @"false"];
+                g_vts ? @"true" : @"false", (g_audioWanted && !g_audioFailed) ? @"true" : @"false"];
             pthread_mutex_unlock(&g_lock);
             snprintf(body, sizeof(body), "%s", b.UTF8String);
             snprintf(hdr, sizeof(hdr),
@@ -1700,6 +1866,8 @@ int main(int argc, char **argv) {
 
     g_encQ = dispatch_queue_create("hoppscreen.encode", dispatch_queue_attr_make_with_qos_class(
                                        DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    g_audioQ = dispatch_queue_create("hoppscreen.audio", DISPATCH_QUEUE_SERIAL);
+    g_audioWanted = !(getenv("HOPPSCREEN_AUDIO") && atoi(getenv("HOPPSCREEN_AUDIO")) == 0);
     if (!startH264Encoder()) fprintf(stderr, "continuing without h264 (mjpeg only)\n");
 
     // resolve next to the binary, not the caller's cwd
@@ -1776,6 +1944,9 @@ int main(int argc, char **argv) {
     printf("  auto-fit: %s\n", g_autofit ?
            "on — the display will match the first client's panel" :
            "off — size pinned by launch args (HOPPSCREEN_AUTOFIT=1 to enable)");
+    printf("  audio: %s\n", g_audioWanted
+           ? "system sound rides the /h264 stream (HOPPSCREEN_AUDIO=0 disables)"
+           : "off (HOPPSCREEN_AUDIO=0)");
     fflush(stdout);
 
     if (getenv("HOPPSCREEN_POLL")) {              // debug: skip push APIs entirely
