@@ -3,12 +3,18 @@ certs/
 *.key
 *.p12
 
+# server login (auto-generated) — never commit
+passwd
+
 # build outputs (rebuilt by run.sh / clang)
 pad6display
 keeper
 bench2
 *.o
 *.dSYM/
+
+# server.pid (make start/stop)
+server.pid
 
 # logs
 *.log

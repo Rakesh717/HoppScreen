@@ -26,16 +26,24 @@ Pad's **browser** (WebCodecs) over LAN. No apps installed on the Pad.
 ## Run
 
 ```bash
-./run.sh                     # looks like 1440x900 (Retina, 2880x1800 px) @120fps
-./adb-launch.sh --install-ca # ONE time: copy the local CA to the Pad + open cert settings
-./adb-launch.sh              # opens https://<mac-ip>:8443 fullscreen on the Pad
+make start                   # build if needed + run detached (log: server.log)
+make stop                    # graceful stop (also removes the virtual display)
+make restart                 # after editing ./passwd or the code
+make status                  # pid, uptime, /status json, recent log
+make log                     # follow the server log
+make run                     # foreground instead (ctrl-c stops)
 ```
 
-Stop with **Ctrl-C**. That ends screen recording and removes the virtual display.
+Then open the printed `https://<mac-ip>:8443` URL on the Pad's Chrome (type it once —
+Chrome remembers it).
+
+Default mode looks like 1440x900 (Retina, 2880x1800 px = Pad 6 native panel) @120fps.
 The encoder sleeps while no client is connected.
 
-Other sizes: `./run.sh 1680 1050` gives more space but smaller, slightly softer text.
-`PAD6_SCALE=1 ./run.sh 2880 1800` uses a non-Retina 1x mode with tiny text.
+Other sizes: `make start ARGS="1680 1050"` gives more space but smaller, slightly
+softer text. `PAD6_SCALE=1 make start ARGS="2880 1800"` uses a non-Retina 1x mode
+with tiny text. `make start ARGS="1440 900 8080 60"` for 60fps (less Mac/Pad load,
+~15ms more lag).
 
 ### Why HTTPS (port 8443)
 
@@ -43,21 +51,36 @@ Chrome only allows its H.264 decoder (WebCodecs) on **secure** pages. Plain
 `http://192.168.x.x:8080` isn't secure, so the page falls back to MJPEG, which is blurry,
 about 24fps and laggy. The server also serves **HTTPS on port+363 (8443)**:
 
-- `certs.sh` (run automatically by `run.sh`) creates a private CA once (`certs/ca.crt`).
+- `certs.sh` (run automatically by `make run`/`make start`) creates a private CA once (`certs/ca.crt`).
   It then issues a server certificate for the Mac's current LAN IPs, and re-issues it
   automatically when you change networks.
 - The CA is **name-constrained** to private IPs, `localhost` and `*.local`. Even if
   `certs/ca.key` leaked, it couldn't be used to impersonate real websites. Keep `certs/`
   private anyway.
-- Install `ca.crt` on the Pad once (`./adb-launch.sh --install-ca`, then Settings →
-  Encryption & credentials → Install a certificate → CA certificate). After that the
-  https page has no warnings. Without installing it, Chrome warns and **Advanced → Proceed** still works.
+- Install `ca.crt` on the Pad once (on the Pad, open `http://<mac-ip>:8080/ca.crt`,
+  then Settings → Encryption & credentials → Install a certificate → CA certificate).
+  After that the https page has no warnings. Without installing it, Chrome warns
+  and **Advanced → Proceed** still works.
 - Opening the plain `http://…:8080` page redirects to https automatically.
 - TLS is macOS SecureTransport (TLS 1.2, ECDSA P-256 / AES-GCM). It adds no noticeable latency.
 
-Alternatives: `./adb-launch.sh --reverse` tunnels over adb to `http://localhost:8080`
-(also secure, no cert; best with a USB cable).
 The server log shows `[client] mode=h264&secure=1` when the sharp path is active.
+
+## Password (login)
+
+Anyone on the same Wi-Fi could open the page and watch, so **every endpoint**
+(both `:8080` and `:8443`) requires a login:
+
+- On first start the server generates `passwd` next to the binary
+  (`user:password`, one line, mode 600) and prints both. Change it by editing
+  the file and restarting. Or set it inline: `PAD6_PASSWORD=x make start`
+  (then any username is accepted).
+- The Pad's Chrome asks once, then caches the login for the origin and attaches
+  it to every request (page, `/h264`, `/stream.mjpg`) — streams are unaffected.
+  If you change the password, reload the page: the 401 makes Chrome ask again.
+- Connections from this Mac (127.0.0.1) are exempt — no prompt.
+- Prefer the https URL: on plain http the password travels only base64-encoded
+  (readable by a LAN sniffer); https encrypts it.
 
 On the Pad, tap once to go fullscreen. Tap again to show or hide the fps overlay.
 
@@ -101,10 +124,11 @@ Debug switches: `PAD6_LOWLAT=0` (standard encoder), `PAD6_NOVUI=1` (no SPS rewri
 
 ## Troubleshooting
 
-- **Blurry / laggy / warning on the Pad page** → you're on the MJPEG fallback; use `./adb-launch.sh`.
+- **Blurry / laggy / warning on the Pad page** → you're on the MJPEG fallback; open the
+  `https://…:8443` URL instead and tap through the cert warning.
 - **Windows dragged to the display don't appear** → grant Screen Recording to your
   terminal app (System Settings → Privacy & Security → Screen Recording), restart server.
-- **Pad can't open the page** → run `./run.sh` first; with `--lan`, check same Wi-Fi and
+- **Pad can't open the page** → run `make start` first; check same Wi-Fi and
   allow the macOS "Local Network" prompt.
 - **Black screen** → tap once; the page auto-reconnects.
 
@@ -115,7 +139,7 @@ Debug switches: `PAD6_LOWLAT=0` (standard encoder), `PAD6_NOVUI=1` (no SPS rewri
 | `virtualdisplay.h/.m` | Private `CGVirtualDisplay` wrapper (HiDPI) |
 | `server.m` | Capture chain + VideoToolbox encoder + HTTP + player page |
 | `certs.sh` | Local CA + per-IP server cert (HTTPS) |
-| `run.sh` / `adb-launch.sh` | build+run / auto-launch on the Pad |
+| `Makefile` | build + `make run/start/stop/restart/status/log` |
 | `keeper.m`, `bench2.m` | Old experiments (not needed anymore) |
 | `vendor/` | Reference projects (macos-virtual-display-vnc etc.) |
 

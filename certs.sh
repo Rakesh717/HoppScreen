@@ -1,9 +1,9 @@
 #!/bin/bash
-# certs.sh — local HTTPS certificates for pad6display (called by run.sh).
+# certs.sh — local HTTPS certificates for pad6display (called by make run/start).
 #
 #  certs/ca.crt / ca.key   a private CA, created ONCE. Install ca.crt on the Pad
-#                          (./adb-launch.sh --install-ca) and https://<mac-ip>:8443
-#                          is trusted with no warnings.
+#                          (download it at http://<mac-ip>:8080/ca.crt) and
+#                          https://<mac-ip>:8443 is trusted with no warnings.
 #                          The CA is NAME-CONSTRAINED: it can only vouch for private
 #                          LAN IPs, localhost and *.local, so even a leaked ca.key can't
 #                          impersonate real websites to the Pad. Keep ca.key private anyway.

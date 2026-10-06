@@ -10,6 +10,9 @@
 //       /frame.jpg   -> single JPEG (debug)
 //       /status      -> JSON stats
 //
+//   Every endpoint requires HTTP Basic auth (./passwd next to the binary, or
+//   PAD6_PASSWORD=<pw> env; loopback (this Mac) is exempt).
+//
 //   clang -fobjc-arc -O2 -I. -framework Foundation -framework CoreGraphics \
 //       -framework AppKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
 //       server.m VirtualDisplay.m -o pad6display
@@ -35,6 +38,10 @@
 #include <netinet/tcp.h>
 #import <Security/Security.h>
 #import <Security/SecureTransport.h>
+#import <CommonCrypto/CommonDigest.h>
+#include <sys/stat.h>
+#include <string.h>
+#include <strings.h>
 #import "virtualdisplay.h"
 
 // ============================================================ shared state
@@ -991,7 +998,7 @@ static BOOL tlsAccept(int fd) {
         static int logged = 0;
         if (st != errSSLClosedAbort && st != errSSLClosedGraceful && (getenv("PAD6_DEBUG") || !logged++))
             fprintf(stderr, "[tls] handshake rejected (%d) — client doesn't trust the cert yet? "
-                            "install it: ./adb-launch.sh --install-ca\n", (int)st);
+                            "install certs/ca.crt on the Pad (README: 'Why HTTPS')\n", (int)st);
         CFRelease(ctx);
         return NO;
     }
@@ -1156,9 +1163,8 @@ static const char *INDEX_HTML =
 " fetch('/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{if(!j.tls_port)return;\n"
 "  const u='https://'+location.hostname+':'+j.tls_port+'/';\n"
 "  if(!sessionStorage.triedTls){sessionStorage.triedTls=1;location.replace(u);return;}\n"
-"  w.innerHTML+='<br><br>Open the secure page: <a style=\"color:#8cf\" href=\"'+u+'\">'+u+'</a><br>'+\n"
-"   'Certificate warning there? Install the CA once: <code>./adb-launch.sh --install-ca</code> on the Mac, '+\n"
-"   'or download <a style=\"color:#8cf\" href=\"/ca.crt\">ca.crt</a> and add it under Settings &rarr; Security &rarr; Encryption &amp; credentials &rarr; Install a certificate &rarr; CA certificate.';\n"
+"  w.innerHTML+='<br><br>Open the secure page: <a style=\"color:#8cf\" href=\"'+u+'\">'+u+'</a> (tap Advanced &rarr; Proceed to ignore the warning)<br>'+\n"
+"   'or install the CA once: download <a style=\"color:#8cf\" href=\"/ca.crt\">ca.crt</a> and add it under Settings &rarr; Security &rarr; Encryption &amp; credentials &rarr; Install a certificate &rarr; CA certificate.';\n"
 " }).catch(()=>{});}\n"
 "function report(x){fetch('/hello?mode='+mode+'&secure='+(window.isSecureContext?1:0)+'&screen='+\n"
 " Math.round(screen.width*devicePixelRatio)+'x'+Math.round(screen.height*devicePixelRatio)+'&dpr='+devicePixelRatio+(x||''),{cache:'no-store'}).catch(()=>{});}\n"
@@ -1185,7 +1191,9 @@ static const char *INDEX_HTML =
 " u32(i){const b=this.b,o=this.o+i;return ((b[o]<<24)>>>0)+(b[o+1]<<16)+(b[o+2]<<8)+b[o+3];}\n"
 " take(k){const r=this.b.slice(this.o,this.o+k);this.o+=k;if(this.o===this.n){this.o=this.n=0;}return r;}}\n"
 "async function startH264(){\n"
-" const res=await fetch('/h264',{cache:'no-store'});if(!res.ok||!res.body)throw new Error('no h264');\n"
+" const res=await fetch('/h264',{cache:'no-store'});\n"
+" if(res.status===401){location.reload();throw new Error('401');}   // login lost: 401 on / re-prompts\n"
+" if(!res.ok||!res.body)throw new Error('no h264');\n"
 " await clockSync().catch(()=>{});\n"
 " const rd=res.body.getReader();const buf=new Buf();let cfg=null,dec=null,g=null,bad=false;\n"
 " try{\n"
@@ -1235,6 +1243,56 @@ static const char *INDEX_HTML =
 "document.addEventListener('visibilitychange',()=>{if(!document.hidden)keepAwake();});\n"
 "</script></body></html>\n";
 
+// ============================================================ password protection
+// The server is reachable by anyone on the same Wi-Fi, so every endpoint
+// requires HTTP Basic auth. The Pad's browser asks once, remembers it for the
+// origin and attaches it to every following request (player page, /h264,
+// /stream.mjpg), so the streams keep working unchanged after login.
+//   credentials: first line of ./passwd next to the binary, "user:password"
+//   (auto-generated on first run, file mode 600), or PAD6_PASSWORD=<password>
+//   env (any username). Connections from 127.0.0.1 (this Mac) are exempt.
+static NSData *g_authHash = nil;        // SHA256(password); nil = protection off
+static NSString *g_authUser = nil;      // required username, nil = any
+
+static BOOL timingSafeEq(const void *a, const void *b, size_t n) {
+    const uint8_t *x = a, *y = b; uint8_t d = 0;
+    for (size_t i = 0; i < n; i++) d |= x[i] ^ y[i];
+    return d == 0;                      // compares digests, never the password itself
+}
+static NSData *sha256(NSString *s) {
+    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    uint8_t dig[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(d.bytes, (CC_LONG)d.length, dig);
+    return [NSData dataWithBytes:dig length:sizeof dig];
+}
+// verify "Authorization: Basic base64(user:password)" in a raw request header
+static BOOL requestAuthorized(const char *req) {
+    const char *h = strcasestr(req, "Authorization:");
+    if (!h) return NO;
+    char scheme[16] = {0}, cred[512] = {0};
+    if (sscanf(h + 14, "%15s %511s", scheme, cred) != 2 || strcasecmp(scheme, "Basic") != 0) return NO;
+    NSData *credData = [[NSData alloc] initWithBase64EncodedString:@(cred)
+        options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    NSString *pair = credData ? [[NSString alloc] initWithData:credData encoding:NSUTF8StringEncoding] : nil;
+    if (!pair) return NO;
+    NSRange colon = [pair rangeOfString:@":"];
+    if (colon.location == NSNotFound) return NO;
+    if (g_authUser && ![[pair substringToIndex:colon.location] isEqualToString:g_authUser]) return NO;
+    NSData *dig = sha256([pair substringFromIndex:colon.location + 1]);
+    return dig.length == g_authHash.length && timingSafeEq(dig.bytes, g_authHash.bytes, dig.length);
+}
+static BOOL isLoopbackPeer(int fd) {
+    struct sockaddr_in peer; socklen_t pl = sizeof(peer);
+    return getpeername(fd, (struct sockaddr *)&peer, &pl) == 0 && peer.sin_family == AF_INET &&
+           (ntohl(peer.sin_addr.s_addr) >> 24) == 127;
+}
+static void peerIp(int fd, char *out, size_t n) {
+    snprintf(out, n, "?");
+    struct sockaddr_in peer; socklen_t pl = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &pl) == 0 && peer.sin_family == AF_INET)
+        inet_ntop(AF_INET, &peer.sin_addr, out, (socklen_t)n);
+}
+
 // ============================================================ handlers
 static void handleClient(int fd, BOOL tls) {
     @autoreleasepool {
@@ -1250,6 +1308,30 @@ static void handleClient(int fd, BOOL tls) {
         if (uh) sscanf(uh + 11, "%255[^\r\n]", ua);
         if (strcmp(path, "/hello") != 0 && strcmp(path, "/time") != 0)
             fprintf(stderr, "[%s] GET %s%s%s\n", tls ? "https" : "http", path, ua[0] ? "  UA=" : "", ua);
+
+        // password gate — every endpoint, on both http and https. After the first
+        // successful login the Pad's browser caches the credentials and attaches
+        // them to all requests (page, /h264, /stream.mjpg), so the player page
+        // itself needs no changes. Connections from this Mac (127.0.0.1) are exempt.
+        if (g_authHash && !isLoopbackPeer(fd) && !requestAuthorized(req)) {
+            char ip[48]; peerIp(fd, ip, sizeof(ip));
+            fprintf(stderr, "[auth] %s %s from %s — wrong or missing password\n",
+                    tls ? "https" : "http", path, ip);
+            static const char body[] =
+                "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                "<body style=\"background:#000;color:#bbb;font:17px system-ui;text-align:center;"
+                "padding-top:40vh\">This screen is password protected.<br>"
+                "Sign in to watch (user + password are printed by <code>make start</code> on the Mac).</body>";
+            char resp[640];
+            snprintf(resp, sizeof(resp),
+                "HTTP/1.1 401 Unauthorized\r\n"
+                "WWW-Authenticate: Basic realm=\"pad6display\", charset=\"UTF-8\"\r\n"
+                "Content-Type: text/html\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                strlen(body), body);
+            writeStr(fd, resp);
+            closeConn(fd);
+            return;
+        }
 
         if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
             char hdr[256];
@@ -1278,7 +1360,7 @@ static void handleClient(int fd, BOOL tls) {
         }
         else if (strcmp(path, "/hello") == 0) {
             fprintf(stderr, "[client] %s%s\n", query,
-                    strstr(query, "mode=mjpeg") ? "   <-- MJPEG fallback: page is not a secure context, run ./adb-launch.sh" : "");
+                    strstr(query, "mode=mjpeg") ? "   <-- MJPEG fallback: page is not a secure context, open the https URL instead" : "");
             writeStr(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
         }
         else if (strcmp(path, "/frame.jpg") == 0) {
@@ -1521,10 +1603,47 @@ int main(int argc, char **argv) {
     g_silentMp4 = [NSData dataWithContentsOfFile:[exeDir stringByAppendingPathComponent:@"silent.mp4"]];
     if (!g_silentMp4) fprintf(stderr, "[init] WARNING: silent.mp4 not found — screen-wakelock video disabled\n");
 
+    // login credentials for the LAN (see the "password protection" section)
+    {
+        const char *envPw = getenv("PAD6_PASSWORD");
+        NSString *user = nil, *pass = nil, *src = nil;
+        if (envPw && envPw[0]) { pass = @(envPw); src = @"PAD6_PASSWORD env, any username"; }
+        else {
+            NSString *pwFile = [exeDir stringByAppendingPathComponent:@"passwd"];
+            NSString *line = [[NSString stringWithContentsOfFile:pwFile encoding:NSUTF8StringEncoding error:nil]
+                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            NSRange c = [line rangeOfString:@":"];
+            if (line.length) {
+                user = c.location == NSNotFound ? nil : [line substringToIndex:c.location];
+                pass = c.location == NSNotFound ? line : [line substringFromIndex:c.location + 1];
+                src = pwFile.lastPathComponent;
+            }
+            if (pass.length == 0) {           // first run: generate and save
+                static const char *abc = "abcdefghjkmnpqrstuvwxyz23456789";   // no 0/O, 1/l/I
+                NSMutableString *gen = [NSMutableString stringWithCapacity:8];
+                for (int i = 0; i < 8; i++) [gen appendFormat:@"%c", abc[arc4random_uniform((uint32_t)strlen(abc))]];
+                user = @"pad"; pass = gen;
+                if ([[NSString stringWithFormat:@"%@:%@\n", user, pass]
+                        writeToFile:pwFile atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+                    chmod(pwFile.fileSystemRepresentation, 0600);
+                    src = @"passwd (generated, mode 600)";
+                } else {
+                    fprintf(stderr, "[auth] WARNING: could not write %s — password valid for this run only\n",
+                            pwFile.UTF8String);
+                    src = @"generated, NOT saved";
+                }
+            }
+        }
+        g_authUser = user;
+        g_authHash = sha256(pass);
+        printf("[auth] password protection ON — user \"%s\"  password \"%s\"  (%s)\n",
+               user.UTF8String ?: "<any>", pass.UTF8String, src.UTF8String);
+    }
+
     int lfd = listenSocket(port);
     if (lfd < 0) return 1;
 
-    // HTTPS: certs.sh (run by run.sh) keeps certs/server.p12 valid for the current IPs
+    // HTTPS: certs.sh (run by make) keeps certs/server.p12 valid for the current IPs
     int tfd = -1;
     {
         const char *tp = getenv("PAD6_TLS_PORT");
@@ -1542,11 +1661,13 @@ int main(int argc, char **argv) {
     if (g_tlsPort) {
         printf("serving — open on the Pad (secure = sharp H.264, direct over Wi-Fi):\n");
         printLocalURLs("https", g_tlsPort);
-        printf("  first time: install the CA on the Pad -> ./adb-launch.sh --install-ca\n");
-        printf("  plain http (MJPEG fallback / adb tunnel) on :%u\n", port);
+        printf("  first time: install certs/ca.crt on the Pad (README: 'Why HTTPS'),\n"
+               "  or just tap Advanced -> Proceed through Chrome's warning\n");
+        printf("  plain http (MJPEG fallback) on :%u\n", port);
     } else {
-        printf("serving — open on the Pad (best: ./adb-launch.sh, enables sharp H.264):\n");
+        printf("serving — open on the Pad:\n");
         printLocalURLs("http", port);
+        printf("  (no certs/server.p12 — MJPEG only; run ./certs.sh for sharp H.264)\n");
     }
     fflush(stdout);
 
