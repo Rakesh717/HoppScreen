@@ -9,6 +9,7 @@
 //       /stream.mjpg -> MJPEG multipart (fallback)
 //       /frame.jpg   -> single JPEG (debug)
 //       /status      -> JSON stats
+//       /input       -> POST touch events; replayed as clicks on the Mac
 //       /fit         -> auto-fit: client reports its panel; server re-execs with
 //                       a matching display size (see "auto-fit" section)
 //
@@ -127,7 +128,10 @@ static void cgFrameHandler(int32_t status, uint64_t time,
     CFRelease(pb);
 }
 
+static volatile BOOL g_audioFailed;    // defined in the audio section; needed by the capture fallbacks
+
 static BOOL startCGStreamCapture(void) {
+    g_audioFailed = YES;     // honesty: audio exists only on the ScreenCaptureKit path
     if (!MyCGDisplayStreamCreateWithDispatchQueue) {
         void *h = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY);
         MyCGDisplayStreamCreateWithDispatchQueue =
@@ -201,6 +205,7 @@ static uint32_t br1(BitR *r) {
 static uint32_t brN(BitR *r, int k) { uint32_t v = 0; while (k--) v = (v << 1) | br1(r); return v; }
 static uint32_t brUE(BitR *r) {
     int z = 0; while (!br1(r) && !r->err && z < 32) z++;
+    if (z > 31) { r->err = YES; return 0; }          // 1u<<32 is UB; oversized code = garbage
     return z ? ((1u << z) - 1 + brN(r, z)) : 0;
 }
 static void bw1(BitW *w, uint32_t b) {
@@ -349,6 +354,8 @@ static NSData *fixInbandSPS(NSData *au) {
     NSMutableData *o = [NSMutableData dataWithCapacity:n + 16];
     for (i = 0; i + 4 <= n; ) {
         size_t L = ((size_t)p[i] << 24) | ((size_t)p[i+1] << 16) | ((size_t)p[i+2] << 8) | p[i+3];
+        if (i + 4 + L > n) break;                    // validate EVERY nal, not just up to the first SPS
+        if (L == 0) { i += 4; continue; }
         NSData *nal = [NSData dataWithBytes:p + i + 4 length:L];
         if ((p[i + 4] & 0x1f) == 7) { NSData *f = fixSPS(p + i + 4, L); if (f) nal = f; }
         uint8_t h[4] = { (uint8_t)(nal.length >> 24), (uint8_t)(nal.length >> 16), (uint8_t)(nal.length >> 8), (uint8_t)nal.length };
@@ -494,8 +501,9 @@ static void processAudioSample(CMSampleBufferRef sb) {
     BOOL planar = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
     UInt32 bpf = asbd->mBytesPerFrame ? asbd->mBytesPerFrame : ch * ((bits + 7) / 8);
     UInt32 bps = (bits + 7) / 8;
-    if (len < frames * (planar ? bps : bpf)) { free(raw); return; }
-    float *in = malloc(frames * 2 * sizeof(float));
+    if (len < frames * (planar ? ch * bps : bpf)) { free(raw); return; }   // both planes must fit
+    float *in = malloc((size_t)frames * 2 * sizeof(float));
+    if (!in) { free(raw); return; }
     for (UInt32 i = 0; i < frames; i++) {
         float l, r;
         if (planar) {                       // plane 0 (all frames), then plane 1
@@ -843,6 +851,7 @@ static void *cursorThread(void *arg);
 static BOOL startCGStreamCapture(void);
 
 static void startPolling(void) {
+    g_audioFailed = YES;     // honesty: audio exists only on the ScreenCaptureKit path
     pthread_t capT, curT;
     pthread_create(&curT, NULL, cursorThread, NULL);   // only polling needs a manual cursor overlay
     pthread_detach(curT);
@@ -1035,15 +1044,19 @@ static void *captureThread(void *arg) {
 // ============================================================ http helpers
 static int listenSocket(uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); return -1; }
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+    fcntl(fd, F_SETFD, FD_CLOEXEC);                  // never leak listeners across a /fit re-exec
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return -1; }
-    listen(fd, 16);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 16) < 0) {
+        fprintf(stderr, "[net] bind/listen :%u failed: %s\n", port, strerror(errno));
+        close(fd); return -1;
+    }
     return fd;
 }
 
@@ -1066,9 +1079,16 @@ static OSStatus sslReadCB(SSLConnectionRef c, void *data, size_t *len) {
     while (got < want) {
         ssize_t n = recv(fd, (char *)data + got, want - got, 0);
         if (n > 0) { got += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // would-block: deliver what arrived, or let the handshake retry —
+            // treating this as an abort kills slow/fragmented TLS handshakes
+            if (got > 0) break;
+            *len = 0;                         // report actual bytes, even on would-block
+            return errSSLWouldBlock;
+        }
         *len = got;
         if (n == 0) return errSSLClosedGraceful;
-        if (errno == EINTR) continue;
         return errSSLClosedAbort;
     }
     *len = got;
@@ -1115,10 +1135,14 @@ static BOOL loadTLSIdentity(NSString *p12Path) {
 static BOOL tlsAccept(int fd) {
     SSLContextRef ctx = SSLCreateContext(NULL, kSSLServerSide, kSSLStreamType);
     if (!ctx) return NO;
-    SSLSetIOFuncs(ctx, sslReadCB, sslWriteCB);
-    SSLSetConnection(ctx, (SSLConnectionRef)(intptr_t)fd);
-    SSLSetProtocolVersionMin(ctx, kTLSProtocol12);
-    SSLSetCertificate(ctx, g_tlsChain);
+    OSStatus cfg = SSLSetIOFuncs(ctx, sslReadCB, sslWriteCB);
+    if (cfg == noErr) cfg = SSLSetConnection(ctx, (SSLConnectionRef)(intptr_t)fd);
+    if (cfg == noErr) cfg = SSLSetProtocolVersionMin(ctx, kTLSProtocol12);
+    if (cfg == noErr) cfg = SSLSetCertificate(ctx, g_tlsChain);
+    if (cfg != noErr) {                               // config failure would surface as a confusing handshake error
+        fprintf(stderr, "[tls] setup failed (%d)\n", (int)cfg);
+        CFRelease(ctx); return NO;
+    }
     OSStatus st;
     do { st = SSLHandshake(ctx); } while (st == errSSLWouldBlock);
     if (st != noErr) {
@@ -1238,6 +1262,7 @@ static void drawCursorOverlay(CGContextRef ctx) {
     CGFloat primaryH = CGDisplayBounds(CGMainDisplayID()).size.height;
     CGPoint cg = { pos.x, primaryH - pos.y };
     CGRect vb = CGDisplayBounds(g_displayID);                 // points
+    vb.size = CGSizeMake(g_dispW, g_dispH);                   // bounds size can be stale (see inputPoint)
     if (!CGRectContainsPoint(vb, cg)) return;
     CGFloat ctxW = (CGFloat)CGBitmapContextGetWidth(ctx), ctxH = (CGFloat)CGBitmapContextGetHeight(ctx);
     CGFloat scale = vb.size.width > 0 ? ctxW / vb.size.width : 1.0;   // px per point (2 on HiDPI)
@@ -1273,11 +1298,15 @@ static const char *INDEX_HTML =
 "<meta name=viewport content='width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no'>\n"
 "<title>HoppScreen</title><style>\n"
 "html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}\n"
-"#c,#s{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;display:none}\n"
+"#c,#s{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;touch-action:none;display:none}\n"
 "#ui{position:fixed;inset:0;display:flex;flex-direction:column;gap:22px;align-items:center;justify-content:center;background:#000;z-index:9;color:#bbb;font:17px system-ui,sans-serif;text-align:center;padding:24px}\n"
 "#warn{color:#fb4;max-width:820px;line-height:1.5;display:none}\n"
 "#warn code{background:#222;padding:2px 6px;border-radius:4px;color:#fff}\n"
-"#st{position:fixed;top:8px;right:12px;color:#7f7;font:13px monospace;z-index:8;display:none;text-shadow:0 0 4px #000;pointer-events:none;white-space:pre;text-align:right}\n"
+"#st{color:#7f7;font:13px monospace;white-space:pre;pointer-events:none;text-align:left;line-height:1.5}\n"
+"#dr{position:fixed;top:0;right:0;bottom:0;width:290px;max-width:72vw;background:rgba(10,10,14,.93);color:#ddd;z-index:12;transform:translateX(105%);transition:transform .25s;padding:16px;box-sizing:border-box;font:14px system-ui;overflow-y:auto}\n"
+"#dr.on{transform:none}\n"
+"#tab{position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:11;background:rgba(10,10,14,.72);color:#ccc;border-radius:12px 0 0 12px;padding:22px 7px;font:17px system-ui;user-select:none;opacity:.55;transition:opacity .9s}\n"
+"#tab.dim{opacity:.12}\n"
 "button{font-size:22px;padding:18px 34px;border-radius:14px;border:0;background:#1a73e8;color:#fff;font-weight:600}\n"
 "</style></head><body>\n"
 "<canvas id=c></canvas><img id=s alt=''><video id=w playsinline loop muted preload=none style='position:fixed;left:0;top:0;width:1px;height:1px;opacity:0.01'></video><div id=st></div>\n"
@@ -1286,7 +1315,7 @@ static const char *INDEX_HTML =
 "const $=i=>document.getElementById(i);\n"
 "const cv=$('c'),img=$('s'),st=$('st'),ui=$('ui');\n"
 "const WC=('VideoDecoder' in window);\n"
-"let alive=false,mode='',fpsN=0,fpsT=0,fps=0,showStats=false,info='';\n"
+" let alive=false,mode='',fpsN=0,fpsT=0,fps=0,info='';\n"
 "if(!WC){const w=$('warn');w.style.display='block';\n"
 " w.innerHTML='&#9888; Sharp low-latency H.264 needs a secure page. Falling back to MJPEG (blurry + laggy).';\n"
 " fetch('/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{if(!j.tls_port)return;\n"
@@ -1309,7 +1338,7 @@ static const char *INDEX_HTML =
 " info=cvInfo+'\\nlatency: arrive '+A+'ms  shown '+S+'ms  last '+Math.round(finalLat)+'ms  q'+q;draw();\n"
 " if(t-lastSend>5000){lastSend=t;report('&arrive_ms='+A+'&shown_ms='+S+'&last_ms='+Math.round(finalLat)+'&fps='+fps+'&decq='+q);}lastRep=t;}\n"
 "let cvInfo='';\n"
-"function draw(){st.textContent=showStats?(mode+' '+fps+' fps\\n'+info):'';}\n"
+"function draw(){st.textContent=mode+' '+fps+' fps\\n'+info;}\n"
 "function tick(){fpsN++;const t=performance.now();if(t-fpsT>=1000){fps=fpsN;fpsN=0;fpsT=t;draw();}}\n"
 "const b64u8=b=>Uint8Array.from(atob(b),c=>c.charCodeAt(0));\n"
 "class Buf{constructor(){this.b=new Uint8Array(1<<20);this.o=0;this.n=0;}\n"
@@ -1324,17 +1353,21 @@ static const char *INDEX_HTML =
 "let aCtx=null,aNode=null,aPend=[],aGo=false,aQueued=0;\n"
 "function audioInit(rate){\n"
 " try{\n"
+"  if(aCtx){try{if(aNode)aNode.disconnect();aCtx.close();}catch(e){}   // reconnect: drop the\n"
+"   aNode=null;aGo=false;aQueued=0;aPend.length=0;}                    // old graph + prebuffer state\n"
 "  aCtx=new AudioContext({latencyHint:'interactive',sampleRate:rate});\n"
 "  const src='class H extends AudioWorkletProcessor{constructor(){super();this.q=[];this.ri=0;this.go=false;'+\n"
 "   'this.port.onmessage=e=>{if(e.data===\\'go\\')this.go=true;else this.q.push(e.data)};};'+\n"
 "   'process(_,o){const L=o[0][0],R=o[0][1];if(!this.go)return true;'+\n"
 "   'for(let i=0;i<L.length;i++){while(this.q.length&&this.ri*2>=this.q[0].length){this.q.shift();this.ri=0;}'+\n"
 "   'const b=this.q[0];if(!b){L[i]=0;R[i]=0;}else{L[i]=b[this.ri*2];R[i]=b[this.ri*2+1];this.ri++;}}'+\n"
+"   'if(!this.q.length){this.go=false;this.port.postMessage(\\'starved\\');}'+   // underrun: re-prebuffer\n"
 "   'if(this.q.length>16){this.q.length=0;this.ri=0;}return true;}}'+\n"
 "   'registerProcessor(\\'h\\',H);';\n"
 "  const url=URL.createObjectURL(new Blob([src],{type:'application/javascript'}));\n"
 "  aCtx.audioWorklet.addModule(url).then(()=>{\n"
 "   aNode=new AudioWorkletNode(aCtx,'h',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2]});\n"
+"   aNode.port.onmessage=e=>{if(e.data==='starved'){aGo=false;aQueued=0;}}\n"
 "   aNode.connect(aCtx.destination);\n"
 "   aCtx.resume().catch(()=>{});\n"
 "  }).catch(()=>{});\n"
@@ -1342,6 +1375,7 @@ static const char *INDEX_HTML =
 "}\n"
 "function audioFeed(i16){\n"
 " if(!aCtx||!aNode)return;\n"
+" if(!aGo&&aCtx.state!=='running'&&aQueued>aCtx.sampleRate*0.6)return;  // autoplay-blocked: don't pile up\n"
 " const f=new Float32Array(i16.length);\n"
 " for(let i=0;i<i16.length;i++)f[i]=i16[i]/32768;\n"
 " if(!aGo){aPend.push(f);aQueued+=f.length/2;\n"
@@ -1351,6 +1385,257 @@ static const char *INDEX_HTML =
 "  return;}\n"
 " aNode.port.postMessage(f);\n"
 "}\n"
+"// ---- input: the receiver becomes a touchscreen -------------------------\n"
+"// full gesture engine -> POST /input; the Mac replays native events:\n"
+"//   1 finger: tap (single/double/triple click), long-press = right click,\n"
+"//             drag; drag started right after a double-tap = word-select\n"
+"//   2 fingers: tap = right click, swipe = scroll, pinch = zoom (Cmd+wheel)\n"
+"//   3+ fingers: tap = middle click, swipe = Spaces / Mission Control /\n"
+"//              App Windows (iPadOS claims some of these - see README)\n"
+"// aspect comes from the visible element's own bitmap, so it works for both\n"
+"// the h264 canvas and the mjpeg img regardless of letterboxing.\n"
+"let lastTouch=0,lastInp=0,mvT=0,chainN=0,chainT=0,chainPt=null,inputOn=null;\n"
+"// windowed = page control (tap restores fullscreen); fullscreen = Mac input.\n"
+"// fsBroken: browser refused fullscreen (e.g. API missing) -> input stays on.\n"
+"// inputOn: runtime presenter-mode toggle (server /input/toggle); null = unknown.\n"
+"const inpOn=()=>armed&&inputOn!==false&&(document.fullscreenElement||fsBroken);\n"
+"const G={state:'',t0:0,start:[0,0],mode:'',fired:false,drag:false,lpT:0,lpFired:false,\n"
+"         sep0:0,sepPrev:null,scPrev:null,scT:0,cx0:0,cy0:0,gx:0,gy:0};\n"
+"function normXY(cx,cy){\n"
+" const el=cv.style.display==='none'?img:cv;\n"
+" const W=el===cv?cv.width:(img.naturalWidth||0),H=el===cv?cv.height:(img.naturalHeight||0);\n"
+" if(!W||!H)return null;\n"
+" // measure the ELEMENT (not innerWidth/Height: 100vh on iPad can exceed the\n"
+" // visible viewport, which would shift the object-fit letterbox)\n"
+" const r=el.getBoundingClientRect();\n"
+" let w=r.width,h=r.width*H/W;\n"
+" if(h>r.height){h=r.height;w=r.height*W/H;}\n"
+" const x=(cx-(r.left+(r.width-w)/2))/w,y=(cy-(r.top+(r.height-h)/2))/h;\n"
+" return [x<0?0:x>1?1:x,y<0?0:y>1?1:y];\n"
+"}\n"
+"function ripple(x,y){                            // visual: where a tap registered\n"
+" const d=document.createElement('div');\n"
+" d.style.cssText='position:fixed;left:'+x+'px;top:'+y+'px;width:26px;height:26px;'\n"
+"  +'border:2px solid rgba(255,255,255,.9);border-radius:50%;pointer-events:none;'\n"
+"  +'transform:translate(-50%,-50%);transition:opacity .35s,width .35s,height .35s;opacity:.9';\n"
+" document.body.appendChild(d);\n"
+" requestAnimationFrame(()=>{d.style.width='70px';d.style.height='70px';d.style.opacity='0';});\n"
+" setTimeout(()=>d.remove(),400);\n"
+"}\n"
+"// single-flight event queue: one POST in flight at a time, order preserved\n"
+"// (fetches over separate connections can otherwise arrive out of order and\n"
+"// turn down+move+up into garbage). Consecutive trailing moves coalesce.\n"
+"let iqBusy=false,iqQ=[];\n"
+"function inp(o){\n"
+" lastInp=Date.now();\n"
+" if(o.t==='move'){while(iqQ.length&&iqQ[iqQ.length-1].t==='move')iqQ.pop();}\n"
+" iqQ.push(o);\n"
+" if(iqQ.length>40)iqQ.splice(0,iqQ.length-40);          // flood cap\n"
+" iqFlush();\n"
+"}\n"
+"function iqFlush(){\n"
+" if(iqBusy||!iqQ.length)return;iqBusy=true;\n"
+" const o=iqQ.shift();\n"
+" fetch('/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})\n"
+"  .catch(()=>{}).finally(()=>{iqBusy=false;iqFlush();});\n"
+"}\n"
+"function pos(T){let x=0,y=0;for(const t of T){x+=t.clientX;y+=t.clientY;}return [x/T.length,y/T.length];}\n"
+"// scroll pipeline: one POST in flight (order + coalescing), flick acceleration,\n"
+"// glide after lift. Every scroll carries the finger position so the Mac can\n"
+"// warp the cursor — wheel events otherwise hit whatever screen the real mouse\n"
+"// was last on, not the window under the fingers.\n"
+"let scBusy=false,scAcc=[0,0],scAt=[0.5,0.5],scMom=0;\n"
+"function scSend(dx,dy,at){\n"
+" if(at){scAt[0]=at[0];scAt[1]=at[1];}\n"
+" if(scBusy){scAcc[0]+=dx;scAcc[1]+=dy;return;}\n"
+" scBusy=true;const px=scAt[0],py=scAt[1];\n"
+" fetch('/input',{method:'POST',headers:{'Content-Type':'application/json'},\n"
+"  body:JSON.stringify({t:'scroll',dx:dx,dy:dy,x:px,y:py})}).catch(()=>{}).finally(()=>{\n"
+"   scBusy=false;\n"
+"   if(scAcc[0]||scAcc[1]){const x=scAcc[0],y=scAcc[1];scAcc[0]=scAcc[1]=0;scSend(x,y);}\n"
+"  });\n"
+"}\n"
+"function scPost(dx,dy,at){                        // finger delta -> accelerated wheel\n"
+" const m=1.9+Math.min(2.4,Math.hypot(dx,dy)*0.008);\n"
+" scSend(Math.round(dx*m),Math.round(dy*m),at);\n"
+"}\n"
+"function gReset(){G.state='';G.mode='';G.fired=false;G.drag=false;G.lpFired=false;\n"
+" clearTimeout(G.lpT);G.sepPrev=null;G.scPrev=null;G.vx=G.vy=0;G.vt=0;}\n"
+"function abortInput(){                           // never leave the Mac's button held\n"
+" clearInterval(scMom);clearTimeout(G.lpT);\n"
+" if(G.drag){G.drag=false;inp({t:'up'});}\n"
+" gReset();\n"
+"}\n"
+"addEventListener('touchcancel',abortInput);\n"
+"addEventListener('blur',abortInput);\n"
+"addEventListener('pagehide',abortInput);\n"
+"document.addEventListener('visibilitychange',()=>{if(document.hidden)abortInput();});\n"
+"document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement)abortInput();});\n"
+"addEventListener('touchstart',e=>{\n"
+" lastTouch=Date.now();\n"
+" clearInterval(scMom);                           // touching stops any glide\n"
+" if(drOpen&&!uiEl(e.target)){openDr(false);return;}   // tap outside closes it, swallows the tap\n"
+" if(uiEl(e.target))return;                            // drawer/tab never click the Mac\n"
+" if(!inpOn())return;\n"
+" const T=e.touches,n=T.length;\n"
+" if(n===1){\n"
+"  const p=normXY(T[0].clientX,T[0].clientY);if(!p)return;\n"
+"  G.rx=T[0].clientX;G.ry=T[0].clientY;         // raw px for the ripple\n"
+"  // multi-tap chain: this touch continues a recent tap at the same spot\n"
+"  if(chainN&&chainN<3&&Date.now()-chainT<320&&chainPt&&\n"
+"     Math.abs(p[0]-chainPt[0])+Math.abs(p[1]-chainPt[1])<0.06)chainN++;\n"
+"  else chainN=1;\n"
+"  gReset();G.state='touch';G.t0=Date.now();G.start=p;\n"
+"  G.lpT=setTimeout(()=>{if(G.state==='touch'&&!G.drag){G.lpFired=true;chainN=0;\n"
+"   ripple(G.rx,G.ry);inp({t:'rclick',x:G.start[0],y:G.start[1]});}},480);\n"
+" }else{                                          // extra fingers: upgrade gesture\n"
+"  clearTimeout(G.lpT);\n"
+"  if(G.drag)inp({t:'up'});G.drag=false;\n"
+"  const prev=G.state;                            // mid-gesture upgrades never count as taps\n"
+"  const p=pos(T);G.state=n===2?'two':'multi';G.t0=Date.now();G.mode='';\n"
+"  G.fired=prev!=='';\n"
+"  G.cx0=p[0];G.cy0=p[1];G.scPrev=null;G.sepPrev=null;\n"
+"  if(n===2)G.sep0=Math.hypot(T[0].clientX-T[1].clientX,T[0].clientY-T[1].clientY);\n"
+"  const q=normXY(p[0],p[1]);if(q)G.start=q;\n"
+" }\n"
+"},{passive:false});\n"
+"addEventListener('touchmove',e=>{\n"
+" lastTouch=Date.now();                           // long gestures keep synthetic-mouse suppression armed\n"
+" if(drOpen||uiEl(e.target))return;               // drawer open: let it scroll natively\n"
+" if(!inpOn())return;\n"
+" e.preventDefault();\n"
+" const T=e.touches,n=T.length;\n"
+" if(n===1&&G.state==='touch'){\n"
+"  const p=normXY(T[0].clientX,T[0].clientY);if(!p)return;\n"
+"  const d=Math.abs(p[0]-G.start[0])+Math.abs(p[1]-G.start[1]);\n"
+"  if(G.drag){\n"
+"   if(Date.now()-mvT>30){mvT=Date.now();inp({t:'move',x:p[0],y:p[1]});}\n"
+"  }else if(!G.lpFired&&d>0.012){                 // deliberate move -> drag\n"
+"   clearTimeout(G.lpT);\n"
+"   const c=chainN>1?2:1;                        // double-tap-drag = word select\n"
+"   chainN=0;G.drag=true;mvT=Date.now();\n"
+"   inp({t:'down',x:G.start[0],y:G.start[1],c:c});inp({t:'move',x:p[0],y:p[1]});\n"
+"  }\n"
+"  return;\n"
+" }\n"
+" if(n===2&&G.state==='two'){\n"
+"  const c=pos(T),sep=Math.hypot(T[0].clientX-T[1].clientX,T[0].clientY-T[1].clientY);\n"
+"  const now=Date.now();\n"
+"  const q=normXY(c[0],c[1]);if(q){G.sx=q[0];G.sy=q[1];}   // gesture position\n"
+"  if(!G.mode){                                   // classify with hysteresis\n"
+"   if(Math.abs(sep-G.sep0)>28)G.mode='pinch';\n"
+"   else if(Math.hypot(c[0]-G.cx0,c[1]-G.cy0)>10)G.mode='scroll';\n"
+"   else return;\n"
+"  }\n"
+"  if(G.mode==='pinch'){\n"
+"   if(now-mvT>40){const dz=sep-(G.sepPrev!=null?G.sepPrev:G.sep0);G.sepPrev=sep;mvT=now;\n"
+"    inp({t:'scroll',zoom:1,dy:dz*2,x:G.sx,y:G.sy});}\n"
+"  }else{                                         // scroll: accelerated, ordered, positioned\n"
+"   if(!G.scPrev){G.scPrev=c;G.scT=now;G.vx=G.vy=0;return;}\n"
+"   if(now-G.scT>=40){\n"
+"    const dx=c[0]-G.scPrev[0],dy=c[1]-G.scPrev[1];   // sign: content follows fingers\n"
+"    G.vx=dx/(now-G.scT);G.vy=dy/(now-G.scT);G.vt=now;// px/ms, seeds the glide\n"
+"    scPost(dx,dy,[G.sx,G.sy]);\n"
+"    G.scT=now;G.scPrev=c;\n"
+"   }\n"
+"  }\n"
+"  return;\n"
+" }\n"
+" // NOTE: no 3/4-finger SWIPE mappings — iPadOS claims those gestures first\n"
+" // (3-finger swipe = screenshot / undo, 4/5-finger = multitasking) and the\n"
+" // browser never sees them. Quick multi-finger TAPS are not claimed -> kept\n"
+" // below as middle click.\n"
+"},{passive:false});\n"
+"addEventListener('touchend',e=>{\n"
+" lastTouch=Date.now();\n"
+" if(!armed&&!G.drag)return;              // still finish a drag after losing fullscreen\n"
+" clearTimeout(G.lpT);\n"
+" if(e.touches.length)return;                     // fingers remain: gesture continues\n"
+" const dt=Date.now()-G.t0;\n"
+" if(G.drag)inp({t:'up'});\n"
+" else if(G.state==='two'&&!G.mode&&!G.fired&&dt<300){ripple(G.rx,G.ry);inp({t:'rclick',x:G.start[0],y:G.start[1]});}\n"
+" else if(G.state==='multi'&&!G.fired&&dt<300){ripple(G.rx,G.ry);inp({t:'mclick',x:G.start[0],y:G.start[1]});}\n"
+" else if(G.state==='touch'&&!G.lpFired){\n"
+"  chainT=Date.now();chainPt=G.start;             // remember for the chain window\n"
+"  ripple(G.rx,G.ry);\n"
+"  inp({t:'tap',x:G.start[0],y:G.start[1],c:Math.min(chainN,3)});\n"
+" }\n"
+" else if(G.state==='two'&&G.mode==='scroll'&&(G.vx||G.vy)&&Date.now()-G.vt<140){   // fresh flick -> glide\n"
+"  let vx=G.vx,vy=G.vy;clearInterval(scMom);\n"
+"  scMom=setInterval(()=>{\n"
+"   if(!inpOn()){clearInterval(scMom);return;}\n"
+"   vx*=0.90;vy*=0.90;\n"
+"   if(Math.hypot(vx,vy)<0.015){clearInterval(scMom);return;}\n"
+"   scPost(vx*40,vy*40,[G.sx,G.sy]);},40);\n"
+" }\n"
+" gReset();\n"
+"},{passive:false});\n"
+"// mouse + wheel: a laptop browser drives the Mac too (hover, drag, wheel;\n"
+"// ctrl+wheel = trackpad pinch -> Mac zoom). dblclick = double-click on the\n"
+"// Mac AND toggles the stats overlay (plain taps click the Mac now).\n"
+"// lastTouch (real touches only) swallows Safari's synthetic mouse events.\n"
+"addEventListener('mousedown',e=>{if(!inpOn()||Date.now()-lastTouch<800||e.button!==0)return;\n"
+" if(drOpen&&!uiEl(e.target)){openDr(false);return;}\n"
+" if(uiEl(e.target))return;\n"
+" const p=normXY(e.clientX,e.clientY);if(!p)return;G.drag=true;\n"
+" inp({t:'down',x:p[0],y:p[1],c:Math.max(1,Math.min(3,e.detail||1))});});\n"
+"addEventListener('mousemove',e=>{if(!inpOn()||Date.now()-lastTouch<800||Date.now()-mvT<=30)return;\n"
+" mvT=Date.now();const p=normXY(e.clientX,e.clientY);if(p)inp({t:'move',x:p[0],y:p[1]});});\n"
+"addEventListener('mouseup',()=>{if(G.drag){G.drag=false;inp({t:'up'});}});\n"
+"addEventListener('dblclick',e=>{if(!inpOn()||Date.now()-lastTouch<800)return;\n"
+" openDr(!drOpen);});\n"   // native double-click comes via the two down/up pairs
+"addEventListener('wheel',e=>{if(!inpOn()||Date.now()-lastTouch<800)return;\n"
+" const p=normXY(e.clientX,e.clientY)||[0.5,0.5];\n"
+" if(e.ctrlKey)inp({t:'scroll',zoom:1,dy:-e.deltaY,x:p[0],y:p[1]});   // trackpad pinch\n"
+" else inp({t:'scroll',dx:-e.deltaX,dy:-e.deltaY,x:p[0],y:p[1]});},{passive:true});\n"
+"// ---- side drawer: stats + input control. Nothing floats over the picture:\n"
+"// a small ⓘ tab on the right edge summons it; it slides away when done.\n"
+"// The input control obeys the backend: it can only flip what the server\n"
+"// allows (input_wanted + input_trusted from /status).\n"
+"const dr=document.createElement('div');dr.id='dr';\n"
+"dr.innerHTML='<div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:12px\">'\n"
+" +'<b>HoppScreen</b><button id=drx style=\"background:none;border:none;color:#999;font:20px system-ui;padding:2px 8px\">\\u2715</button></div>';\n"
+"document.body.appendChild(dr);\n"
+"dr.appendChild(st);                                 // the stats block lives in here now\n"
+"const tab=document.createElement('div');tab.id='tab';tab.textContent='\\u24d8';\n"
+"document.body.appendChild(tab);\n"
+"setTimeout(()=>tab.classList.add('dim'),4000);      // fades to a whisper after settling in\n"
+"let drOpen=false;\n"
+"function openDr(v){drOpen=!!v;dr.classList.toggle('on',drOpen);}\n"
+"tab.addEventListener('click',e=>{e.stopPropagation();tab.classList.remove('dim');openDr(!drOpen);});\n"
+"tab.addEventListener('touchend',e=>{e.stopPropagation();e.preventDefault();tab.classList.remove('dim');openDr(!drOpen);},{passive:false});\n"
+"dr.querySelector('#drx').addEventListener('click',e=>{e.stopPropagation();openDr(false);});\n"
+"function uiEl(t){return !!(t&&t.closest&&t.closest('#dr,#tab'));}\n"
+"// input control: shown once /status says whether the backend permits input\n"
+"let inputAllowed=null,inputWhy='';\n"
+"const inSec=document.createElement('div');inSec.style.cssText='margin-top:16px';\n"
+"const inHdr=document.createElement('div');inHdr.textContent='Input';\n"
+"inHdr.style.cssText='font-weight:600;margin-bottom:6px;color:#eee';\n"
+"const btnIn=document.createElement('button');\n"
+"btnIn.style.cssText='width:100%;padding:10px;margin-top:2px;border-radius:8px;border:1px solid rgba(255,255,255,.35);background:rgba(0,0,0,.6);color:#fff;font:14px system-ui';\n"
+"const inWhy=document.createElement('div');\n"
+"inWhy.style.cssText='font:12px system-ui;color:#999;margin-top:6px;line-height:1.4';\n"
+"inSec.appendChild(inHdr);inSec.appendChild(btnIn);inSec.appendChild(inWhy);\n"
+"inSec.style.display='none';\n"
+"dr.appendChild(inSec);\n"
+"function updInput(){\n"
+" if(inputAllowed===null){inSec.style.display='none';return;}\n"
+" inSec.style.display='block';\n"
+" if(!inputAllowed){\n"
+"  btnIn.disabled=true;btnIn.style.opacity=.55;btnIn.textContent='\\uD83D\\uDD12 Input unavailable';\n"
+"  inWhy.textContent=inputWhy;return;\n"
+" }\n"
+" btnIn.disabled=false;btnIn.style.opacity=1;\n"
+" btnIn.textContent=inputOn===false?'\\uD83D\\uDD12 View-only — tap to control':'\\uD83D\\uDC58 Controlling the Mac — tap for view-only';\n"
+" inWhy.textContent=inputOn===false?'input is disabled; touches do nothing':'your touches click the Mac';\n"
+"}\n"
+"function toggleInp(){\n"
+" if(inputAllowed!==true)return;\n"
+" fetch('/input/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})\n"
+"  .then(r=>r.text()).then(t=>{inputOn=t==='on';updInput();}).catch(()=>{});\n"
+"}\n"
+"btnIn.addEventListener('click',e=>{e.stopPropagation();toggleInp();});\n"
+"btnIn.addEventListener('touchend',e=>{e.stopPropagation();e.preventDefault();toggleInp();},{passive:false});\n"
 "async function startH264(){\n"
 " const res=await fetch('/h264',{cache:'no-store'});\n"
 " if(res.status===401){location.reload();throw new Error('401');}   // login lost: 401 on / re-prompts\n"
@@ -1385,11 +1670,19 @@ static const char *INDEX_HTML =
 " img.onerror=()=>{if(alive)setTimeout(()=>{img.src='/stream.mjpg?t='+Date.now();},900);};\n"
 " img.onload=()=>tick();img.src='/stream.mjpg?t='+Date.now();}\n"
 "async function fit(){try{const s=await(await fetch('/status',{cache:'no-store'})).json();\n"
+" if('input' in s){\n"
+"  inputOn=!!s.input;\n"
+"  inputAllowed=s.input_wanted!==false&&s.input_trusted!==false;\n"
+"  inputWhy=s.input_wanted===false?'the Mac is running view-only (started with INPUT=0)'\n"
+"           :'allow hoppscreen on the Mac: System Settings > Privacy & Security > Accessibility';\n"
+"  updInput();\n"
+" }\n"
 " const W=Math.round(screen.width*devicePixelRatio),H=Math.round(screen.height*devicePixelRatio);\n"
 " if(!W||!H||W<500||H<500)return;if(Math.abs(W-s.pixel_width)<=W/8&&Math.abs(H-s.pixel_height)<=H/8)return;\n"
 " let hz=0;const d=[];let n=0;await new Promise(r=>requestAnimationFrame(function f(t){d.push(t);if(++n>=24)r();else requestAnimationFrame(f)}));\n"
 " if(d.length>5){const dt=d[d.length-1]-d[0];if(dt>0)hz=Math.round(1000*(d.length-1)/dt);}\n"
-" await fetch('/fit?w='+W+'&h='+H+'&dpr='+devicePixelRatio+'&hz='+(hz||60),{cache:'no-store'});\n"
+" await fetch('/fit',{method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',\n"
+"  body:JSON.stringify({w:W,h:H,dpr:devicePixelRatio,hz:hz||60})});\n"
 "}catch(e){}}\n"
 "async function start(){\n"
 " alive=true;st.style.display='block';\n"
@@ -1401,16 +1694,23 @@ static const char *INDEX_HTML =
 "}\n"
 "const wv=$('w');\n"
 "function keepAwake(){if(wv.paused)wv.play().catch(()=>{});try{navigator.wakeLock&&navigator.wakeLock.request('screen').catch(()=>{});}catch(e){}}\n"
-"async function goFull(){try{if(!document.fullscreenElement)await document.documentElement.requestFullscreen({navigationUI:'hide'});}catch(e){}\n"
+"let fsBroken=false;\n"
+"async function goFull(){try{if(!document.fullscreenElement)await document.documentElement.requestFullscreen({navigationUI:'hide'});}catch(e){fsBroken=true;}\n"
 " try{await screen.orientation.lock('landscape');}catch(e){}}\n"
 "// stream starts immediately (decoder warm before the tap); fullscreen needs a user gesture\n"
 "start();\n"
 "let armed=false;\n"
-"document.addEventListener('click',async()=>{\n"
+"document.addEventListener('click',async e=>{\n"
+" if(uiEl(e.target))return;\n"
+" if(drOpen){openDr(false);return;}\n"
 " if(!armed){armed=true;ui.remove();await goFull();\n"
 "  if(aCtx&&aCtx.state!=='running')aCtx.resume().catch(()=>{});\n"
-"  wv.src='/silent.mp4';wv.volume=0;await wv.play().catch(()=>{});keepAwake();setInterval(keepAwake,5000);return;}\n"
-" if(!document.fullscreenElement)goFull();else{showStats=!showStats;draw();}\n"
+"  wv.src='/silent.mp4';wv.volume=0;await wv.play().catch(()=>{});keepAwake();setInterval(keepAwake,5000);\n"
+"  setTimeout(fit,1200);                          // re-fit after orientation settles\n"
+"  return;}\n"
+" if(!document.fullscreenElement){goFull();return;}   // left fullscreen: any tap restores it\n"
+" if(Date.now()-lastTouch<800||Date.now()-lastInp<800)return;   // input already acted\n"
+" openDr(!drOpen);                                  // plain click (no input action): drawer\n"
 "});\n"
 "document.addEventListener('visibilitychange',()=>{if(!document.hidden)keepAwake();});\n"
 "</script></body></html>\n";
@@ -1465,6 +1765,30 @@ static void peerIp(int fd, char *out, size_t n) {
         inet_ntop(AF_INET, &peer.sin_addr, out, (socklen_t)n);
 }
 
+// case-insensitive header lookup bounded by the line end. Searching the whole
+// request with strcasestr would match header names echoed in the body (e.g. a
+// text/plain CSRF POST mentioning "application/json" in its payload).
+static void headerVal(const char *req, const char *name, char *out, size_t n) {
+    out[0] = 0;
+    size_t nl = strlen(name);
+    for (const char *ln = req, *eol; (eol = strstr(ln, "\r\n")) != NULL; ln = eol + 2) {
+        if (strncasecmp(ln, name, nl) == 0 && ln[nl] == ':') {
+            const char *v = ln + nl + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            size_t l = (size_t)(eol - v);
+            if (l > n - 1) l = n - 1;
+            memcpy(out, v, l); out[l] = 0;
+            return;
+        }
+    }
+}
+static BOOL isJsonContent(const char *req) {
+    char ct[96];
+    headerVal(req, "Content-Type", ct, sizeof ct);
+    return strncmp(ct, "application/json", 16) == 0 &&
+           (ct[16] == 0 || ct[16] == ';' || ct[16] == ' ');
+}
+
 // ============================================================ auto-fit (/fit)
 // HoppScreen is generic: the receiver may be any device with a browser. The
 // page compares its own panel with /status and calls /fit?w=&h=&dpr=&hz=;
@@ -1480,6 +1804,7 @@ static int g_httpFd = -1, g_tlsFd = -1;
 static BOOL g_autofit = NO;
 static char g_exePath[PATH_MAX] = {0};
 static time_t g_lastFit = 0;                 // survives re-execs via HOPPSCREEN_LASTFIT
+static volatile BOOL g_fitBusy = NO;         // test-and-set: one /fit decision at a time
 
 static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) __attribute__((noreturn));
 static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) {
@@ -1508,21 +1833,173 @@ static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) {
     _exit(1);
 }
 
+// ============================================================ touch input (/input)
+// The other direction of the pipe: the page posts touch events here and the
+// server replays them onto the virtual display with CGEventPost — the receiver
+// becomes a touchscreen for the Mac (tap=click, long-press=right-click,
+// drag=left-drag, two-finger swipe=scroll wheel; a mouse in a laptop browser
+// works too). Coordinates are normalized (0..1 over the stream picture), so
+// they survive auto-fit and re-execs.
+//   - macOS requires the Accessibility permission for event injection; until
+//     it is granted input is inert (/status "input":false, banner says so).
+//   - POST-only + Content-Type: application/json, so a page from another site
+//     open in the receiver's browser cannot forge events (no-cors requests
+//     cannot carry that header). Auth applies as everywhere else.
+//   - HOPPSCREEN_INPUT=0 disables (view-only).
+static volatile BOOL g_inputWanted = NO;       // env boot default (HOPPSCREEN_INPUT)
+static BOOL g_inputTrusted = NO;               // Accessibility granted
+static BOOL g_inputEnabled = YES;              // runtime toggle (presenter mode), POST /input/toggle
+static BOOL g_inputLogged = NO, g_inputDragging = NO;
+static CGPoint g_lastInputPoint = {0, 0};      // 'up' without coords releases at the last spot
+static dispatch_queue_t g_inputQ = NULL;       // serial: applies events in arrival order
+static BOOL g_scrollInvert = NO;               // HOPPSCREEN_SCROLL_INVERT=1 flips wheel/zoom
+static CGEventSourceRef g_evtSrc = NULL;
+
+static double clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static CGPoint inputPoint(double nx, double ny) {   // stream coords -> global desktop points
+    CGRect b = CGDisplayBounds(g_displayID);         // origin is global; the SIZE can lag
+    return CGPointMake(b.origin.x + clampd(nx, 0, 1) * (g_dispW - 1),  // g_dispW/H = served mode
+                       b.origin.y + clampd(ny, 0, 1) * (g_dispH - 1)); // -1: nx=1 stays ON the display
+}
+
+static CGEventSourceRef evtSrc(void) {
+    if (!g_evtSrc) g_evtSrc = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+    return g_evtSrc;
+}
+
+static void postMouseC(CGEventType ty, CGPoint p, CGMouseButton btn, int clicks, uint64_t flags) {
+    CGEventRef e = CGEventCreateMouseEvent(evtSrc(), ty, p, btn);
+    if (e) {
+        if (clicks > 1) CGEventSetIntegerValueField(e, kCGMouseEventClickState, clicks);
+        if (flags) CGEventSetFlags(e, flags);
+        CGEventPost(kCGHIDEventTap, e);
+        CFRelease(e);
+    }
+}
+
+static void postKey(CGKeyCode code, uint64_t flags) {  // flags = modifiers held during the press
+    CGEventRef d = CGEventCreateKeyboardEvent(evtSrc(), code, true);
+    CGEventRef u = CGEventCreateKeyboardEvent(evtSrc(), code, false);
+    if (d && u) {
+        if (flags) { CGEventSetFlags(d, flags); CGEventSetFlags(u, flags); }
+        CGEventPost(kCGHIDEventTap, d);
+        CGEventPost(kCGHIDEventTap, u);
+    }
+    if (d) CFRelease(d);
+    if (u) CFRelease(u);
+}
+
+// gesture -> native event. Event vocabulary (see the page's gesture engine):
+//   tap(c=1..3) left click with click count (2 = open/word, 3 = paragraph)
+//   rclick      right click          mclick  middle click (open in new tab)
+//   down/move/up  left-drag, c carries the click count (double-tap-drag = word select)
+//   scroll      wheel, dx/dy pixels; zoom:1 adds Cmd (pinch -> app zoom)
+//   key         spaceL/spaceR (Ctrl-Arrow = switch Space), mission (Ctrl-Up),
+//               appwin (Ctrl-Down), launchpad (F4)
+// strict schema check BEFORE touching the event: a malformed {"t":"tap","x":[]}
+// would throw an unrecognized-selector exception on a connection thread and
+// kill the whole server. Only exact types pass; unknown event types are 400s.
+static BOOL inputEventValid(NSDictionary *ev) {
+    NSString *t = ev[@"t"];
+    if (![t isKindOfClass:[NSString class]]) return NO;
+    if (![t isEqualToString:@"tap"] && ![t isEqualToString:@"rclick"] &&
+        ![t isEqualToString:@"mclick"] && ![t isEqualToString:@"down"] &&
+        ![t isEqualToString:@"move"] && ![t isEqualToString:@"up"] &&
+        ![t isEqualToString:@"scroll"] && ![t isEqualToString:@"key"]) return NO;
+    for (NSString *k in @[@"x", @"y", @"dx", @"dy", @"c"]) {
+        id v = ev[k];
+        if (v && (![v isKindOfClass:[NSNumber class]] || !isfinite([v doubleValue]))) return NO;
+    }
+    if (ev[@"k"] && ![ev[@"k"] isKindOfClass:[NSString class]]) return NO;
+    if (ev[@"zoom"] && ![ev[@"zoom"] isKindOfClass:[NSNumber class]]) return NO;
+    return YES;
+}
+
+static void applyInputEvent(NSDictionary *ev) {
+    NSString *t = ev[@"t"];
+    if (![t isKindOfClass:[NSString class]]) return;
+    // events without x/y ('up', and scroll bursts that omitted position)
+    // reuse the last known point so releasing a drag ends where the finger was
+    BOOL hasXY = [ev[@"x"] isKindOfClass:[NSNumber class]] && [ev[@"y"] isKindOfClass:[NSNumber class]];
+    CGPoint p = hasXY ? inputPoint([ev[@"x"] doubleValue], [ev[@"y"] doubleValue]) : g_lastInputPoint;
+    if (hasXY) g_lastInputPoint = p;
+    int c = [ev[@"c"] intValue];                        // click count
+    if (c < 1 || c > 3) c = 1;
+    if ([t isEqualToString:@"tap"]) {                   // cursor jump + click
+        postMouseC(kCGEventMouseMoved, p, kCGMouseButtonLeft, 0, 0);
+        postMouseC(kCGEventLeftMouseDown, p, kCGMouseButtonLeft, c, 0);
+        postMouseC(kCGEventLeftMouseUp, p, kCGMouseButtonLeft, c, 0);
+    } else if ([t isEqualToString:@"rclick"]) {
+        postMouseC(kCGEventMouseMoved, p, kCGMouseButtonLeft, 0, 0);
+        postMouseC(kCGEventRightMouseDown, p, kCGMouseButtonRight, 1, 0);
+        postMouseC(kCGEventRightMouseUp, p, kCGMouseButtonRight, 1, 0);
+    } else if ([t isEqualToString:@"mclick"]) {
+        postMouseC(kCGEventMouseMoved, p, kCGMouseButtonLeft, 0, 0);
+        postMouseC(kCGEventOtherMouseDown, p, kCGMouseButtonCenter, 1, 0);
+        postMouseC(kCGEventOtherMouseUp, p, kCGMouseButtonCenter, 1, 0);
+    } else if ([t isEqualToString:@"down"]) {
+        g_inputDragging = YES;
+        postMouseC(kCGEventMouseMoved, p, kCGMouseButtonLeft, 0, 0);
+        postMouseC(kCGEventLeftMouseDown, p, kCGMouseButtonLeft, c, 0);
+    } else if ([t isEqualToString:@"move"]) {
+        postMouseC(g_inputDragging ? kCGEventLeftMouseDragged : kCGEventMouseMoved,
+                   p, kCGMouseButtonLeft, 0, 0);
+    } else if ([t isEqualToString:@"up"]) {
+        g_inputDragging = NO;
+        postMouseC(kCGEventLeftMouseUp, p, kCGMouseButtonLeft, 0, 0);
+    } else if ([t isEqualToString:@"scroll"]) {         // dy/dx pixels, "natural" direction
+        // wheel events go to whatever is UNDER THE CURSOR — without a warp a
+        // scroll-only gesture would hit whatever screen the real mouse sits on.
+        // The page sends the finger position; land the cursor there first.
+        if (hasXY) postMouseC(kCGEventMouseMoved, p, kCGMouseButtonLeft, 0, 0);
+        double dy = [ev[@"dy"] doubleValue] * (g_scrollInvert ? -1 : 1);
+        double dx = [ev[@"dx"] doubleValue] * (g_scrollInvert ? -1 : 1);
+        CGEventRef e = CGEventCreateScrollWheelEvent(evtSrc(), kCGScrollEventUnitPixel, 2,
+                                                     (int32_t)clampd(dy, -2000, 2000),
+                                                     (int32_t)clampd(dx, -2000, 2000));
+        if (e) {
+            if ([ev[@"zoom"] boolValue]) CGEventSetFlags(e, kCGEventFlagMaskCommand);
+            CGEventPost(kCGHIDEventTap, e);
+            CFRelease(e);
+        }
+    } else if ([t isEqualToString:@"key"]) {
+        NSString *k = ev[@"k"];
+        if ([k isEqualToString:@"spaceL"])      postKey(123, kCGEventFlagMaskControl);  // Ctrl-Left
+        else if ([k isEqualToString:@"spaceR"]) postKey(124, kCGEventFlagMaskControl);  // Ctrl-Right
+        else if ([k isEqualToString:@"mission"])postKey(126, kCGEventFlagMaskControl);  // Ctrl-Up
+        else if ([k isEqualToString:@"appwin"]) postKey(125, kCGEventFlagMaskControl);  // Ctrl-Down
+        else if ([k isEqualToString:@"launchpad"]) postKey(118, 0);                     // F4
+    }
+}
+
 // ============================================================ handlers
 static void handleClient(int fd, BOOL tls) {
     @autoreleasepool {
         if (tls && !tlsAccept(fd)) { close(fd); return; }
         char req[4096] = {0};
         ssize_t n = connRecv(fd, req, sizeof(req) - 1);
-        if (n <= 0) { closeConn(fd); return; }
+        if (n > 0 && (req[0] < 'A' || req[0] > 'Z')) {   // not an HTTP method: TLS bytes on the
+            closeConn(fd); return;                       // plain port / port scans — reject instantly
+        }
+        // headers may span reads — wait for the terminator (or buffer exhaustion)
+        while (n > 0 && n < (ssize_t)sizeof(req) - 1 && !memmem(req, (size_t)n, "\r\n\r\n", 4)) {
+            ssize_t r = connRecv(fd, req + n, sizeof(req) - 1 - (size_t)n);
+            if (r <= 0) break;
+            n += r;
+        }
+        if (n <= 0 || !memmem(req, (size_t)n, "\r\n\r\n", 4)) {
+            // Never parse a truncated header as a complete request/body.
+            closeConn(fd); return;
+        }
         char method[16] = {0}, path[256] = {0}, query[256] = {0};
         sscanf(req, "%15s %255s", method, path);
         char *q = strchr(path, '?'); if (q) { snprintf(query, sizeof(query), "%s", q + 1); *q = 0; }
         char ua[256] = {0};
         char *uh = strcasestr(req, "User-Agent:");
         if (uh) sscanf(uh + 11, "%255[^\r\n]", ua);
-        if (strcmp(path, "/hello") != 0 && strcmp(path, "/time") != 0)
-            fprintf(stderr, "[%s] GET %s%s%s\n", tls ? "https" : "http", path, ua[0] ? "  UA=" : "", ua);
+        if (strcmp(path, "/hello") != 0 && strcmp(path, "/time") != 0 && strcmp(path, "/input") != 0)
+            fprintf(stderr, "[%s] %s %s%s%s\n", tls ? "https" : "http", method, path, ua[0] ? "  UA=" : "", ua);
 
         // password gate — every endpoint, on both http and https. After the first
         // successful login the receiver's browser caches the credentials and attaches
@@ -1630,6 +2107,11 @@ static void handleClient(int fd, BOOL tls) {
         }
         else if (strcmp(path, "/h264") == 0) {
             __sync_fetch_and_add(&g_h264Clients, 1);         // also wakes the encoder if idle
+            // watermark FIRST, then request the IDR: if the keyframe is encoded
+            // before waitAfter is sampled, the priming scan below would skip it
+            // and a static screen could stay black until the next periodic IDR
+            uint64_t waitAfter;
+            pthread_mutex_lock(&g_lock); waitAfter = g_auHead; pthread_mutex_unlock(&g_lock);
             g_forceKey = 1;
             NSString *codec = nil, *desc = nil;
             for (int i = 0; i < 100 && g_running; i++) {     // wait for encoder config (max ~5s)
@@ -1664,8 +2146,6 @@ static void handleClient(int fd, BOOL tls) {
             // behind (Wi-Fi hiccup), drop the backlog and resync on a fresh IDR rather
             // than playing seconds-old video.
             const uint64_t MAX_LAG = (uint64_t)(g_fps / 4) + 2;   // ~250ms of frames
-            uint64_t waitAfter;
-            pthread_mutex_lock(&g_lock); waitAfter = g_auHead; pthread_mutex_unlock(&g_lock);
             uint64_t lastSent = 0, lastSentV = 0;             // V = video-only sequence
             BOOL primed = NO;
             int sent = 0, resyncs = 0;
@@ -1684,7 +2164,10 @@ static void handleClient(int fd, BOOL tls) {
                         if (!primed) waitAfter = g_auHead;
                     }
                     if (primed) {
-                        if (g_auVideoHead - lastSentV > MAX_LAG) {   // video too far behind: resync
+                        // video lag OR physical ring overflow (audio chunks share the
+                        // 512 slots; a static screen + music can wrap the ring while
+                        // video lag stays low — silently losing reference frames)
+                        if (g_auVideoHead - lastSentV > MAX_LAG || g_auHead - lastSent >= AU_RING) {
                             primed = NO; waitAfter = g_auHead; lastSentV = g_auVideoHead;
                             g_forceKey = 1; resyncs++;
                         } else {
@@ -1717,18 +2200,99 @@ static void handleClient(int fd, BOOL tls) {
             fprintf(stderr, "[stream] h264 client done (%d AUs, %d lag resyncs)\n", sent, resyncs);
             __sync_fetch_and_sub(&g_h264Clients, 1);
         }
+        else if (strcmp(path, "/input/toggle") == 0) {
+            // presenter mode: flip input acceptance at runtime. HARD GATE: only
+            // works when the server booted with INPUT=1 — a boot-disabled server
+            // can never be talked into accepting input from the receiver side.
+            char ip[48];
+            if (strcmp(method, "POST") != 0 || !isJsonContent(req) || !g_inputWanted) {
+                const char *msg = !g_inputWanted ? "input is off (boot again with INPUT=1)" : "";
+                char why[192];
+                snprintf(why, sizeof(why),
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
+                    "Connection: close\r\n\r\n%s", strlen(msg), msg);
+                writeStr(fd, why);
+            } else {
+                g_inputEnabled = !g_inputEnabled;
+                peerIp(fd, ip, sizeof ip);
+                fprintf(stderr, "[input] %s by %s\n", g_inputEnabled ? "ENABLED" : "DISABLED (view-only)", ip);
+                const char *b = g_inputEnabled ? "on" : "off";
+                char resp[128];
+                snprintf(resp, sizeof(resp),
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
+                    "Cache-Control: no-store\r\nConnection: close\r\n\r\n%s", strlen(b), b);
+                writeStr(fd, resp);
+            }
+        }
+        else if (strcmp(path, "/input") == 0) {
+            // touch backchannel; see the "touch input" section above
+            if (strcmp(method, "POST") != 0 || !isJsonContent(req)) {
+                writeStr(fd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            } else if (!g_inputWanted || !g_inputEnabled) {
+                writeStr(fd, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n"
+                             "Connection: close\r\n\r\ninput is off");
+            } else {
+                long cl = 0;
+                char chv[32];
+                headerVal(req, "Content-Length", chv, sizeof chv);
+                cl = atol(chv);
+                if (cl < 2 || cl > 2048) {
+                    writeStr(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                } else {
+                    char body[2049] = {0};          // small events only; bigger = abuse
+                    size_t have = 0;
+                    char *b0 = strstr(req, "\r\n\r\n");
+                    if (b0) {                       // body bytes that arrived with the headers
+                        size_t inReq = (size_t)(req + n - (b0 + 4));
+                        if (inReq > (size_t)cl) inReq = (size_t)cl;
+                        memcpy(body, b0 + 4, inReq);
+                        have = inReq;
+                    }
+                    while ((long)have < cl && have < sizeof body - 1) {
+                        ssize_t r = connRecv(fd, body + have, (size_t)cl - have);
+                        if (r <= 0) break;
+                        have += (size_t)r;
+                    }
+                    NSDictionary *ev = have == (size_t)cl ?
+                        [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:body length:have]
+                                                        options:0 error:nil] : nil;
+                    if (![ev isKindOfClass:[NSDictionary class]] || !inputEventValid(ev)) {
+                        writeStr(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    } else {
+                        g_inputTrusted = AXIsProcessTrusted();
+                        if (!g_inputLogged) {
+                            char ip[48]; peerIp(fd, ip, sizeof ip);
+                            fprintf(stderr, "[input] first event '%s' from %s — %s\n",
+                                    ev[@"t"] ? [ev[@"t"] UTF8String] : "?", ip,
+                                    g_inputTrusted ? "replaying on the display"
+                                                   : "BLOCKED, no Accessibility permission (System Settings > Privacy & Security > Accessibility > hoppscreen)");
+                            g_inputLogged = YES;
+                        }
+                        if (g_inputTrusted)
+                            dispatch_async(g_inputQ, ^{ applyInputEvent(ev); });   // serial: keeps order
+                        writeStr(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+                    }
+                }
+            }
+        }
         else if (strcmp(path, "/status") == 0) {
             char body[1024], hdr[128];
+            if (g_inputWanted) g_inputTrusted = AXIsProcessTrusted();
             pthread_mutex_lock(&g_lock);
             NSString *b = [NSString stringWithFormat:
                 @"{\"display\":%u,\"width\":%u,\"height\":%u,\"pixel_width\":%u,\"pixel_height\":%u,"
                 @"\"capture\":\"%s\",\"capture_fps\":%.1f,\"encode_fps\":%.1f,"
-                @"\"tls_port\":%u,\"sc_callbacks\":%llu,\"h264_total_kbits\":%llu,\"mjpeg_clients\":%d,\"h264_clients\":%d,\"h264\":%@,\"audio\":%@}",
+                @"\"tls_port\":%u,\"sc_callbacks\":%llu,\"h264_total_kbits\":%llu,\"mjpeg_clients\":%d,\"h264_clients\":%d,\"h264\":%@,\"audio\":%@,"
+                @"\"input\":%@,\"input_wanted\":%@,\"input_enabled\":%@,\"input_trusted\":%@}",
                 g_displayID, g_dispW, g_dispH, g_pixW, g_pixH,
                 g_scStream ? "screencapturekit" : (g_cgStream ? "cgdisplaystream" : "polling"),
                 g_captureFps, g_encFps, (unsigned)g_tlsPort, (unsigned long long)g_scCallbacks,
                 (unsigned long long)(g_h264Bytes * 8 / 1000), g_mjpegClients, g_h264Clients,
-                g_vts ? @"true" : @"false", (g_audioWanted && !g_audioFailed) ? @"true" : @"false"];
+                g_vts ? @"true" : @"false", (g_audioWanted && !g_audioFailed) ? @"true" : @"false",
+                (g_inputWanted && g_inputEnabled && g_inputTrusted) ? @"true" : @"false",
+                g_inputWanted ? @"true" : @"false",
+                g_inputEnabled ? @"true" : @"false",
+                g_inputTrusted ? @"true" : @"false"];
             pthread_mutex_unlock(&g_lock);
             snprintf(body, sizeof(body), "%s", b.UTF8String);
             snprintf(hdr, sizeof(hdr),
@@ -1737,35 +2301,70 @@ static void handleClient(int fd, BOOL tls) {
             writeStr(fd, hdr); writeStr(fd, body);
         }
         else if (strcmp(path, "/fit") == 0) {
-            // auto-fit: the page reports its panel (pixels, dpr, measured Hz)
+            // auto-fit: the page reports its panel. POST + JSON only (a GET here
+            // could be triggered cross-site with a plain <img> tag).
             long w = 0, h = 0; double dpr = 2.0, hz = 0;
-            char *p;
-            if ((p = strstr(query, "w=")) != NULL) w = atol(p + 2);
-            if ((p = strstr(query, "h=")) != NULL) h = atol(p + 2);
-            if ((p = strstr(query, "dpr=")) != NULL) dpr = atof(p + 4);
-            if ((p = strstr(query, "hz=")) != NULL) hz = atof(p + 3);
-            if (w < 500 || w > 3840 || h < 500 || h > 2400 || w * h > 3840L * 2160L) {
-                writeStr(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-            } else if (!g_autofit) {
-                writeStr(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
-            } else if (labs(w - (long)g_pixW) <= w / 8 && labs(h - (long)g_pixH) <= h / 8) {
-                writeStr(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"); // close enough
+            if (strcmp(method, "POST") != 0 || !isJsonContent(req)) {
+                writeStr(fd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             } else {
-                time_t now = time(NULL);
-                if (now - g_lastFit < 30) {              // don't ping-pong between devices
-                    writeStr(fd, "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                long cl = 0;
+                char chv[32];
+                headerVal(req, "Content-Length", chv, sizeof chv);
+                cl = atol(chv);
+                char fbody[256] = {0};
+                size_t have = 0;
+                char *b0 = strstr(req, "\r\n\r\n");
+                // Require exact bounded framing; incomplete JSON must never cause an exec.
+                if (b0 && cl >= 2 && cl <= 255) { size_t inReq = (size_t)(req + n - (b0 + 4)); if (inReq > (size_t)cl) inReq = (size_t)cl; memcpy(fbody, b0 + 4, inReq); have = inReq; }
+                while (cl >= 2 && cl <= 255 && (long)have < cl) {
+                    ssize_t r = connRecv(fd, fbody + have, (size_t)cl - have);
+                    if (r <= 0) break;
+                    have += (size_t)r;
+                }
+                NSDictionary *fj = cl >= 2 && cl <= 255 && have == (size_t)cl ?
+                    [NSJSONSerialization JSONObjectWithData:
+                    [NSData dataWithBytes:fbody length:have] options:0 error:nil] : nil;
+                // Containers/null lack numeric selectors; reject them instead of crashing.
+                BOOL fitValid = [fj isKindOfClass:[NSDictionary class]];
+                if (fitValid) for (NSString *k in @[@"w", @"h", @"dpr", @"hz"]) {
+                    id v = fj[k];
+                    if (v && (![v isKindOfClass:[NSNumber class]] || !isfinite([v doubleValue]))) fitValid = NO;
+                }
+                if (!fitValid) {
+                    writeStr(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
                 } else {
-                    g_lastFit = now;
-                    BOOL hi = dpr >= 1.5;                // Retina panels render at 2x points
-                    uint32_t ptW = hi ? (uint32_t)((w + 1) / 2) : (uint32_t)w;
-                    uint32_t ptH = hi ? (uint32_t)((h + 1) / 2) : (uint32_t)h;
-                    double fps = 60.0;
-                    if (hz > 0) fps = hz < 30 ? 30 : (hz > 120 ? 120 : (double)((int)(hz / 10) * 10));
-                    writeStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n"
-                                 "Connection: close\r\n\r\nrefit\n");
-                    closeConn(fd);
-                    usleep(300000);                      // let the response flush
-                    refitExec(ptW, ptH, fps, hi);        // never returns
+                    w = [fj[@"w"] longValue]; h = [fj[@"h"] longValue];
+                    dpr = [fj[@"dpr"] doubleValue]; hz = [fj[@"hz"] doubleValue];
+                    if (dpr < 0.5 || dpr > 4) dpr = 2.0;
+                    if (w < 500 || w > 3840 || h < 500 || h > 2400 || w * h > 3840L * 2160L) {
+                        writeStr(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+                    } else if (!g_autofit) {
+                        writeStr(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+                    } else if (labs(w - (long)g_pixW) <= w / 8 && labs(h - (long)g_pixH) <= h / 8) {
+                        writeStr(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"); // close enough
+                    } else {
+                        time_t now = time(NULL);
+                        if (__sync_lock_test_and_set(&g_fitBusy, 1)) {
+                            // Losing callers must not release the current owner's lock.
+                            writeStr(fd, "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        } else if (now - g_lastFit < 30) {                // don't ping-pong devices
+                            __sync_lock_release(&g_fitBusy);
+                            writeStr(fd, "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        } else {
+                            g_lastFit = now;
+                            // Keep ownership until exec so a second refit cannot race us.
+                            BOOL hi = dpr >= 1.5;            // Retina panels render at 2x points
+                            uint32_t ptW = hi ? (uint32_t)((w + 1) / 2) : (uint32_t)w;
+                            uint32_t ptH = hi ? (uint32_t)((h + 1) / 2) : (uint32_t)h;
+                            double fps = 60.0;
+                            if (hz > 0) fps = hz < 30 ? 30 : (hz > 120 ? 120 : (double)((int)(hz / 10) * 10));
+                            writeStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n"
+                                         "Connection: close\r\n\r\nrefit\n");
+                            closeConn(fd);
+                            usleep(300000);                  // let the response flush
+                            refitExec(ptW, ptH, fps, hi);    // never returns
+                        }
+                    }
                 }
             }
         }
@@ -1777,7 +2376,12 @@ static void handleClient(int fd, BOOL tls) {
 }
 
 typedef struct { int fd; BOOL tls; } ConnArg;
-void *handleClientWrapper(void *p) { ConnArg a = *(ConnArg *)p; free(p); handleClient(a.fd, a.tls); return NULL; }
+static volatile int g_conns = 0;
+void *handleClientWrapper(void *p) {
+    ConnArg a = *(ConnArg *)p; free(p); handleClient(a.fd, a.tls);
+    __sync_fetch_and_sub(&g_conns, 1);
+    return NULL;
+}
 
 typedef struct { int lfd; BOOL tls; } ListenArg;
 static void *serverThread(void *arg) {
@@ -1787,22 +2391,36 @@ static void *serverThread(void *arg) {
         struct sockaddr_in cli; socklen_t cl = sizeof(cli);
         int fd = accept(lfd, (struct sockaddr *)&cli, &cl);
         if (fd < 0) continue;
+        // Both listeners accept concurrently: reserve the shared budget atomically.
+        if (__sync_fetch_and_add(&g_conns, 1) >= 48) {
+            __sync_fetch_and_sub(&g_conns, 1); close(fd); continue;
+        }
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));   // no Nagle: frames leave immediately
-        struct timeval tv = {10, 0};
+        fcntl(fd, F_SETFD, FD_CLOEXEC);                  // active streams must not survive a /fit re-exec
+        struct timeval tv = {10, 0}, stv = {3, 0};
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));      // stalled handshakes/requests can't pin a thread
+        // 3s receive timeout: a wedged TLS handshake or half-open request then
+        // parks its thread for 3s, not 10 — mobile receivers that flap (screen
+        // lock, background tab, preconnects) can't starve the connection budget
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &stv, sizeof(stv));
+        ConnArg *ca = malloc(sizeof(ConnArg));
+        // The worker immediately copies/frees ca: initializing after pthread_create
+        // wrote into freed heap memory and also handed it garbage fd/tls values.
+        if (ca) { ca->fd = fd; ca->tls = la.tls; }
         pthread_t t;
-        ConnArg *ca = malloc(sizeof(ConnArg)); ca->fd = fd; ca->tls = la.tls;
-        pthread_create(&t, NULL, handleClientWrapper, ca);
+        if (!ca || pthread_create(&t, NULL, handleClientWrapper, ca) != 0) {
+            __sync_fetch_and_sub(&g_conns, 1);
+            if (ca) free(ca); close(fd); continue;
+        }
         pthread_detach(t);
     }
     return NULL;
 }
 
 // ============================================================ main
-static void onSig(int sig) { (void)sig; g_running = NO; }
+static void onSig(int sig) { fprintf(stderr, "[sig] %d -> shutdown\n", sig); g_running = NO; }
 
 int main(int argc, char **argv) {
     // args are the LOGICAL ("looks like") size in points; the framebuffer is 2x that
@@ -1813,7 +2431,8 @@ int main(int argc, char **argv) {
     uint16_t port = argc > 3 ? (uint16_t)atoi(argv[3]) : 8080;
     g_fps = argc > 4 ? atof(argv[4]) : 120.0;   // high-hz panels: 120 halves per-frame latency
     BOOL hiDPI = !(getenv("HOPPSCREEN_SCALE") && atoi(getenv("HOPPSCREEN_SCALE")) == 1);
-    if (!w || !h || !port || g_fps < 1 || g_fps > 120) {
+    if (!w || !h || !port || w < 500 || h < 500 || w > 3840 || h > 2400 ||
+        !isfinite(g_fps) || g_fps < 1 || g_fps > 120) {   // atof("nan") would pass < and > checks
         fprintf(stderr, "usage: %s [width_pt height_pt [port [fps]]]   (default 1440 900 8080 120)\n", argv[0]);
         return 2;
     }
@@ -1868,10 +2487,25 @@ int main(int argc, char **argv) {
                                        DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     g_audioQ = dispatch_queue_create("hoppscreen.audio", DISPATCH_QUEUE_SERIAL);
     g_audioWanted = !(getenv("HOPPSCREEN_AUDIO") && atoi(getenv("HOPPSCREEN_AUDIO")) == 0);
+    g_inputWanted = getenv("HOPPSCREEN_INPUT") && atoi(getenv("HOPPSCREEN_INPUT")) != 0;   // opt-in: view-only by default
+    g_scrollInvert = (getenv("HOPPSCREEN_SCROLL_INVERT") && atoi(getenv("HOPPSCREEN_SCROLL_INVERT")) != 0);
+    if (g_inputWanted) {
+        g_inputQ = dispatch_queue_create("hoppscreen.input", DISPATCH_QUEUE_SERIAL);
+        g_evtSrc = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);   // once, not lazily per thread
+        g_inputTrusted = AXIsProcessTrusted();
+        if (!g_inputTrusted) {
+            fprintf(stderr, "[input] touch input needs the Accessibility permission —\n"
+                            "[input] allow hoppscreen in System Settings > Privacy & Security > Accessibility\n");
+            NSDictionary *opt = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt : @YES};
+            AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opt);   // system dialog, once
+        } else fprintf(stderr, "[input] touch input ready (accessibility granted)\n");
+    }
     if (!startH264Encoder()) fprintf(stderr, "continuing without h264 (mjpeg only)\n");
 
-    // resolve next to the binary, not the caller's cwd
-    NSString *exeDir = [[NSString stringWithUTF8String:argv[0]] stringByDeletingLastPathComponent];
+    // resolve next to the binary, not the caller's cwd (g_exePath is absolute,
+    // so a PATH launch doesn't make us read/write assets in whatever cwd)
+    NSString *exeDir = [[NSString stringWithUTF8String:g_exePath[0] ? g_exePath : argv[0]]
+        stringByDeletingLastPathComponent];
     g_silentMp4 = [NSData dataWithContentsOfFile:[exeDir stringByAppendingPathComponent:@"silent.mp4"]];
     if (!g_silentMp4) fprintf(stderr, "[init] WARNING: silent.mp4 not found — screen-wakelock video disabled\n");
 
@@ -1947,6 +2581,9 @@ int main(int argc, char **argv) {
     printf("  audio: %s\n", g_audioWanted
            ? "system sound rides the /h264 stream (HOPPSCREEN_AUDIO=0 disables)"
            : "off (HOPPSCREEN_AUDIO=0)");
+    printf("  input: %s\n", !g_inputWanted ? "off — view-only (start with INPUT=1 to allow touch control)"
+           : (g_inputTrusted ? "receiver touches click the Mac (toggle live from the page)"
+                             : "WAITING — grant Accessibility, then it goes live"));
     fflush(stdout);
 
     if (getenv("HOPPSCREEN_POLL")) {              // debug: skip push APIs entirely

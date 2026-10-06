@@ -15,9 +15,15 @@ PORT    ?= 8080
 # that opens the page. Setting ARGS (e.g. ARGS="1680 1050") pins the size and
 # disables auto-fit.
 ARGS    ?=
-# audio: 0 = stream the Mac's system sound with the video (default), 0 = silent
+# audio: 1 = stream the Mac's system sound with the video, 0 = silent (default)
 AUDIO   ?= 0
 export HOPPSCREEN_AUDIO = $(AUDIO)
+# input: 0 = view-only by default — receiver touches never click the Mac.
+# INPUT=1 opts in at boot (needs the Accessibility permission, granted once);
+# when booted with INPUT=1 the page toggle can still flip view-only live,
+# but a boot-disabled server can never be enabled from the receiver side.
+INPUT   ?= 0
+export HOPPSCREEN_INPUT = $(INPUT)
 
 .DEFAULT_GOAL := help
 .PHONY: help run start stop restart status log build
@@ -31,7 +37,7 @@ help:
 	@echo "  status     running? pid, uptime, /status json, recent log"
 	@echo "  log        follow the server log (ctrl-c to leave)"
 	@echo "  build      compile only (run/start do this automatically)"
-	@echo "  vars:      ARGS=\"1680 1050\" pins the display size  AUDIO=0 mutes the stream  PORT=8080 (probe)"
+	@echo "  vars:      ARGS=\"1680 1050\" pins the display size  AUDIO=1 adds sound  INPUT=1 allows touch control  PORT=8080 (probe)"
 
 # staleness (missing binary / newer sources) is make's own dependency check
 $(BIN): server.m virtualdisplay.m virtualdisplay.h
