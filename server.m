@@ -14,7 +14,7 @@
 //       -framework AppKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
 //       server.m VirtualDisplay.m -o pad6display
 //
-// Usage: pad6display [width_pt height_pt [port [fps]]]   defaults: 1440 900 8080 60 (HiDPI -> 2880x1800 px)
+// Usage: pad6display [width_pt height_pt [port [fps]]]   defaults: 1440 900 8080 120 (HiDPI -> 2880x1800 px)
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -33,6 +33,8 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/tcp.h>
+#import <Security/Security.h>
+#import <Security/SecureTransport.h>
 #import "virtualdisplay.h"
 
 // ============================================================ shared state
@@ -44,6 +46,8 @@ static uint32_t g_pixW = 0, g_pixH = 0;                       // framebuffer siz
 static double g_fps = 60.0;
 static volatile int g_forceKey = 0;            // next encoded frame must be an IDR (new client / resync)
 static volatile uint64_t g_lastSubmitNs = 0;   // host time of the last frame handed to the encoder
+static volatile uint64_t g_lastRealNs = 0;     // last frame that came from capture (not a repeat)
+static volatile int g_repeatsSinceReal = 0;
 static NSString *g_codec = nil;                // "avc1.PPCCLL" derived from the real avcC
 static dispatch_queue_t g_encQ = NULL;         // serializes ALL encoder submits (SC frames + refresh)
 
@@ -57,6 +61,7 @@ static uint64_t g_jpegSeq = 0;
 typedef struct {
     uint64_t seq;
     BOOL isKey;
+    BOOL isRepeat;         // re-submitted unchanged frame (decoder flush / refinement)
     int64_t ptsUs;
     NSData *data;          // AVCC (4-byte NALU length prefixes), no SPS/PPS in-band
 } AURec;
@@ -163,7 +168,187 @@ static NSData *copyJpeg(uint64_t *seqOut) {
     return f;
 }
 
+// ============================================================ SPS VUI rewrite (decoder latency)
+// VideoToolbox writes SPS with pic_order_cnt_type=0 and NO VUI bitstream_restriction.
+// A spec-compliant decoder must then assume frames may be reordered and hold up to
+// MaxDpbFrames (≈9 at 2880x1800, level 5.2) before outputting — ~150ms of lag while
+// moving, and the final frames stay stuck when motion stops. Hardware decoders
+// (Android MediaCodec / Qualcomm) do exactly that. Like WebRTC's SpsVuiRewriter, we
+// add bitstream_restriction with max_num_reorder_frames=0 and
+// max_dec_frame_buffering=max_num_ref_frames so every frame is output immediately.
+typedef struct { const uint8_t *p; size_t n, bit; BOOL err; } BitR;
+typedef struct { uint8_t *p; size_t cap, bit; } BitW;
+static uint32_t br1(BitR *r) {
+    if (r->bit >= r->n * 8) { r->err = YES; return 0; }
+    uint32_t v = (r->p[r->bit >> 3] >> (7 - (r->bit & 7))) & 1; r->bit++; return v;
+}
+static uint32_t brN(BitR *r, int k) { uint32_t v = 0; while (k--) v = (v << 1) | br1(r); return v; }
+static uint32_t brUE(BitR *r) {
+    int z = 0; while (!br1(r) && !r->err && z < 32) z++;
+    return z ? ((1u << z) - 1 + brN(r, z)) : 0;
+}
+static void bw1(BitW *w, uint32_t b) {
+    if (w->bit >= w->cap * 8) return;
+    if (b) w->p[w->bit >> 3] |= (uint8_t)(0x80 >> (w->bit & 7));
+    w->bit++;
+}
+static void bwN(BitW *w, uint32_t v, int k) { while (k--) bw1(w, (v >> k) & 1); }
+static void bwUE(BitW *w, uint32_t v) {
+    uint32_t x = v + 1; int len = 0; while ((x >> len) > 1) len++;
+    bwN(w, 0, len); bwN(w, x, len + 1);
+}
+// copy helpers: read from r, write identical bits to w, return value
+static uint32_t cN(BitR *r, BitW *w, int k) { uint32_t v = brN(r, k); bwN(w, v, k); return v; }
+static uint32_t cUE(BitR *r, BitW *w) { uint32_t v = brUE(r); bwUE(w, v); return v; }
+static void cHRD(BitR *r, BitW *w) {
+    uint32_t cnt = cUE(r, w); cN(r, w, 4); cN(r, w, 4);
+    for (uint32_t i = 0; i <= cnt && i < 32; i++) { cUE(r, w); cUE(r, w); cN(r, w, 1); }
+    cN(r, w, 20);   // 4 x u(5)
+}
+
+// rbsp (no emulation bytes) -> rewritten rbsp. Returns nil if unparseable.
+static NSData *spsAddLowDelayVUI(NSData *rbsp) {
+    BitR r = { rbsp.bytes, rbsp.length, 0, NO };
+    size_t cap = rbsp.length + 32;
+    NSMutableData *out = [NSMutableData dataWithLength:cap];
+    BitW w = { out.mutableBytes, cap, 0 };
+    cN(&r, &w, 8);                                  // NAL header
+    uint32_t profile = cN(&r, &w, 8); cN(&r, &w, 8); cN(&r, &w, 8);
+    cUE(&r, &w);                                    // sps id
+    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
+        profile == 83 || profile == 86 || profile == 118 || profile == 128 || profile == 138 ||
+        profile == 139 || profile == 134 || profile == 135) {
+        uint32_t chroma = cUE(&r, &w);
+        if (chroma == 3) cN(&r, &w, 1);
+        cUE(&r, &w); cUE(&r, &w); cN(&r, &w, 1);
+        if (cN(&r, &w, 1)) {                        // scaling matrices
+            for (int i = 0; i < (chroma != 3 ? 8 : 12); i++) if (cN(&r, &w, 1)) {
+                int size = i < 6 ? 16 : 64, last = 8, next = 8;
+                for (int j = 0; j < size && next; j++) {
+                    uint32_t u = cUE(&r, &w);
+                    int32_t d = (u & 1) ? (int32_t)((u + 1) / 2) : -(int32_t)(u / 2);
+                    next = (last + d + 256) % 256; if (next) last = next;
+                }
+            }
+        }
+    }
+    cUE(&r, &w);                                    // log2_max_frame_num
+    uint32_t poc = cUE(&r, &w);
+    if (poc == 0) cUE(&r, &w);
+    else if (poc == 1) {
+        cN(&r, &w, 1); cUE(&r, &w); cUE(&r, &w);
+        uint32_t k = cUE(&r, &w); for (uint32_t i = 0; i < k && i < 256; i++) cUE(&r, &w);
+    }
+    uint32_t maxRef = cUE(&r, &w);
+    cN(&r, &w, 1); cUE(&r, &w); cUE(&r, &w);
+    if (!cN(&r, &w, 1)) cN(&r, &w, 1);             // frame_mbs_only / mb_adaptive
+    cN(&r, &w, 1);                                  // direct_8x8
+    if (cN(&r, &w, 1)) { cUE(&r, &w); cUE(&r, &w); cUE(&r, &w); cUE(&r, &w); }
+    uint32_t vui = brN(&r, 1); bw1(&w, 1);          // force VUI present
+    if (vui) {
+        if (cN(&r, &w, 1) && cN(&r, &w, 8) == 255) cN(&r, &w, 32);
+        if (cN(&r, &w, 1)) cN(&r, &w, 1);
+        if (cN(&r, &w, 1)) { cN(&r, &w, 4); if (cN(&r, &w, 1)) cN(&r, &w, 24); }
+        if (cN(&r, &w, 1)) { cUE(&r, &w); cUE(&r, &w); }
+        if (cN(&r, &w, 1)) { cN(&r, &w, 32); cN(&r, &w, 32); cN(&r, &w, 1); }
+        uint32_t nal = cN(&r, &w, 1); if (nal) cHRD(&r, &w);
+        uint32_t vcl = cN(&r, &w, 1); if (vcl) cHRD(&r, &w);
+        if (nal || vcl) cN(&r, &w, 1);
+        cN(&r, &w, 1);                              // pic_struct_present
+        if (brN(&r, 1)) {
+            // restriction already present (low-latency encoder writes reorder=0 but
+            // max_dec_frame_buffering=9): re-emit with the minimal values below
+            brN(&r, 1); brUE(&r); brUE(&r); brUE(&r); brUE(&r);
+            uint32_t reorder = brUE(&r), dpb = brUE(&r);
+            if (reorder == 0 && dpb <= (maxRef ? maxRef : 1)) return nil;   // already minimal
+        }
+    } else {
+        bwN(&w, 0, 8);  // aspect, overscan, signal, chroma_loc, timing, nal_hrd, vcl_hrd, pic_struct = 0
+    }
+    if (r.err) return nil;
+    bw1(&w, 1);                                     // bitstream_restriction_flag
+    bw1(&w, 1);                                     // motion_vectors_over_pic_boundaries
+    bwUE(&w, 2); bwUE(&w, 1); bwUE(&w, 16); bwUE(&w, 16);   // spec defaults
+    bwUE(&w, 0);                                    // max_num_reorder_frames = 0
+    bwUE(&w, maxRef ? maxRef : 1);                  // max_dec_frame_buffering
+    bw1(&w, 1);                                     // rbsp_stop_one_bit
+    while (w.bit & 7) bw1(&w, 0);
+    out.length = w.bit / 8;
+    return out;
+}
+static NSData *nalUnescape(const uint8_t *p, size_t n) {
+    NSMutableData *o = [NSMutableData dataWithCapacity:n]; int zeros = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (zeros >= 2 && p[i] == 3) { zeros = 0; continue; }
+        [o appendBytes:&p[i] length:1];
+        zeros = p[i] == 0 ? zeros + 1 : 0;
+    }
+    return o;
+}
+static NSData *nalEscape(NSData *d) {
+    const uint8_t *p = d.bytes; NSMutableData *o = [NSMutableData dataWithCapacity:d.length + 8];
+    int zeros = 0; const uint8_t three = 3;
+    for (size_t i = 0; i < d.length; i++) {
+        if (zeros >= 2 && p[i] <= 3) { [o appendBytes:&three length:1]; zeros = 0; }
+        [o appendBytes:&p[i] length:1];
+        zeros = p[i] == 0 ? zeros + 1 : 0;
+    }
+    return o;
+}
+static NSData *fixSPS(const uint8_t *sps, size_t n) {
+    NSData *r = spsAddLowDelayVUI(nalUnescape(sps, n));
+    return r ? nalEscape(r) : nil;
+}
+// avcC with every SPS rewritten (nil = unchanged / unparseable)
+static NSData *fixAvcC(NSData *avcC) {
+    const uint8_t *a = avcC.bytes; size_t n = avcC.length;
+    if (n < 7) return nil;
+    NSMutableData *o = [NSMutableData dataWithBytes:a length:6];
+    size_t i = 6; int numSps = a[5] & 0x1f; BOOL changed = NO;
+    for (int k = 0; k < numSps; k++) {
+        if (i + 2 > n) return nil;
+        size_t L = ((size_t)a[i] << 8) | a[i + 1];
+        if (i + 2 + L > n) return nil;
+        NSData *f = fixSPS(a + i + 2, L);
+        NSData *use = f ?: [NSData dataWithBytes:a + i + 2 length:L];
+        changed |= (f != nil);
+        uint8_t hdr[2] = { (uint8_t)(use.length >> 8), (uint8_t)use.length };
+        [o appendBytes:hdr length:2]; [o appendData:use];
+        i += 2 + L;
+    }
+    [o appendBytes:a + i length:n - i];             // PPS (+ High-profile tail) untouched
+    return changed ? o : nil;
+}
+// in-band SPS (if VT ever emits them in AUs) get the same rewrite
+static NSData *fixInbandSPS(NSData *au) {
+    const uint8_t *p = au.bytes; size_t n = au.length, i = 0;
+    BOOL has = NO;
+    while (i + 4 <= n) {
+        size_t L = ((size_t)p[i] << 24) | ((size_t)p[i+1] << 16) | ((size_t)p[i+2] << 8) | p[i+3];
+        if (i + 4 + L > n || L == 0) return au;
+        if ((p[i + 4] & 0x1f) == 7) { has = YES; break; }
+        i += 4 + L;
+    }
+    if (!has) return au;
+    NSMutableData *o = [NSMutableData dataWithCapacity:n + 16];
+    for (i = 0; i + 4 <= n; ) {
+        size_t L = ((size_t)p[i] << 24) | ((size_t)p[i+1] << 16) | ((size_t)p[i+2] << 8) | p[i+3];
+        NSData *nal = [NSData dataWithBytes:p + i + 4 length:L];
+        if ((p[i + 4] & 0x1f) == 7) { NSData *f = fixSPS(p + i + 4, L); if (f) nal = f; }
+        uint8_t h[4] = { (uint8_t)(nal.length >> 24), (uint8_t)(nal.length >> 16), (uint8_t)(nal.length >> 8), (uint8_t)nal.length };
+        [o appendBytes:h length:4]; [o appendData:nal];
+        i += 4 + L;
+    }
+    return o;
+}
+
 // ============================================================ H.264 encoder
+static volatile double g_encLatMs = 0;   // avg submit -> encoded output
+static int64_t realtimeUsFromUptimeUs(int64_t upUs) {
+    int64_t nowUp = (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000);
+    int64_t nowRt = (int64_t)(clock_gettime_nsec_np(CLOCK_REALTIME) / 1000);
+    return nowRt - (nowUp - upUs);
+}
 static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
                      VTEncodeInfoFlags flags, CMSampleBufferRef sb) {
     if (status != noErr || !sb || !CMSampleBufferIsValid(sb)) return;
@@ -183,13 +368,21 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
         CFBooleanRef notSync = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_NotSync);
         isKey = (notSync != kCFBooleanTrue);
     }
+    // PTS is CLOCK_UPTIME_RAW µs at submit (see vtSubmit) -> encode latency + the
+    // wall-clock capture time the player uses to measure end-to-end latency
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
-    int64_t ptsUs = (int64_t)(CMTimeGetSeconds(pts) * 1000000.0);
+    int64_t upUs = pts.value;
+    int64_t nowUp = (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000);
+    g_encLatMs = g_encLatMs * 0.95 + ((nowUp - upUs) / 1000.0) * 0.05;
+    int64_t ptsUs = realtimeUsFromUptimeUs(upUs);
+    if (!getenv("PAD6_NOVUI")) data = fixInbandSPS(data);
+    len = data.length;
 
     pthread_mutex_lock(&g_lock);
     uint64_t seq = g_auHead + 1;
     AURec *slot = &g_au[seq % AU_RING];
-    slot->seq = seq; slot->isKey = isKey; slot->ptsUs = ptsUs; slot->data = data;
+    slot->seq = seq; slot->isKey = isKey; slot->isRepeat = (srcRefCon != NULL);
+    slot->ptsUs = ptsUs; slot->data = data;
     g_auHead = seq;
     g_h264Bytes += len;
     g_encOutFrames++;
@@ -202,6 +395,13 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
             CFDataRef avcC = atoms ? CFDictionaryGetValue(atoms, CFSTR("avcC")) : NULL;
             if (avcC && CFDataGetLength(avcC) >= 4) {
                 NSData *d = (__bridge NSData *)avcC;
+                NSData *fixed = getenv("PAD6_NOVUI") ? nil : fixAvcC(d);
+                static BOOL said = NO;
+                if (!said) { said = YES;
+                    fprintf(stderr, "[h264] SPS low-delay VUI rewrite: %s\n",
+                            fixed ? "applied (decoder outputs every frame immediately)" : "NOT applied");
+                }
+                if (fixed) d = fixed;
                 NSString *b64 = [d base64EncodedStringWithOptions:0];
                 if (![b64 isEqualToString:g_avcCB64]) {
                     const uint8_t *a = d.bytes;   // [1]=profile [2]=constraints [3]=level
@@ -220,7 +420,7 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
 static uint64_t nowNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
 // single entry point into the encoder (call only on g_encQ or the polling thread)
-static void vtSubmit(CVPixelBufferRef pb) {
+static void vtSubmitEx(CVPixelBufferRef pb, BOOL repeat) {
     if (!g_vts || !pb) return;
     uint64_t t = nowNs();
     static uint64_t lastPts = 0;
@@ -231,7 +431,8 @@ static void vtSubmit(CVPixelBufferRef pb) {
     if (__sync_lock_test_and_set(&g_forceKey, 0))
         props = @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES};
     OSStatus est = VTCompressionSessionEncodeFrame(g_vts, pb, pts, kCMTimeInvalid,
-                                                   (__bridge CFDictionaryRef)props, NULL, NULL);
+                                                   (__bridge CFDictionaryRef)props,
+                                                   repeat ? (void *)1 : NULL, NULL);
     if (est != noErr) {
         static int ewarn = 0;
         if (!ewarn++) fprintf(stderr, "[h264] EncodeFrame failed: %d\n", (int)est);
@@ -239,6 +440,7 @@ static void vtSubmit(CVPixelBufferRef pb) {
     g_lastSubmitNs = t;
     g_encFrames++;
 }
+static void vtSubmit(CVPixelBufferRef pb) { vtSubmitEx(pb, NO); }
 
 static void setNum(CFStringRef key, double v) {
     CFNumberRef n = CFNumberCreate(NULL, kCFNumberDoubleType, &v);
@@ -249,18 +451,32 @@ static void setNum(CFStringRef key, double v) {
 }
 
 static BOOL startH264Encoder(void) {
-    NSDictionary *encSpec = @{
+    // Low-latency mode (the FaceTime path): the hardware encoder emits each frame as
+    // soon as it is coded instead of pipelining several. PAD6_LOWLAT=0 disables it.
+    BOOL lowLat = !(getenv("PAD6_LOWLAT") && atoi(getenv("PAD6_LOWLAT")) == 0);
+    NSMutableDictionary *encSpec = [@{
         (__bridge NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
         (__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
-    };
+    } mutableCopy];
+    if (lowLat) encSpec[(__bridge NSString *)kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = @YES;
     OSStatus st = VTCompressionSessionCreate(NULL, g_pixW, g_pixH, kCMVideoCodecType_H264,
                                              (__bridge CFDictionaryRef)encSpec, NULL, NULL,
                                              vtOutput, NULL, &g_vts);
+    if (st != noErr && lowLat) {
+        fprintf(stderr, "[h264] low-latency encoder unavailable (%d) — using standard mode\n", (int)st);
+        lowLat = NO;
+        [encSpec removeObjectForKey:(__bridge NSString *)kVTVideoEncoderSpecification_EnableLowLatencyRateControl];
+        st = VTCompressionSessionCreate(NULL, g_pixW, g_pixH, kCMVideoCodecType_H264,
+                                        (__bridge CFDictionaryRef)encSpec, NULL, NULL, vtOutput, NULL, &g_vts);
+    }
     if (st != noErr) { fprintf(stderr, "[h264] VTCompressionSessionCreate failed: %d\n", (int)st); return NO; }
     VTSessionSetProperty(g_vts, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     // High profile: ~15-20% better quality/bit than Main -> sharper text at the same rate.
+    // Low-latency mode requires the Constrained variant (no B-frames anyway).
     // Level auto-picks 5.1/5.2 for 2880x1800@60 (codec string is derived from the real avcC).
-    VTSessionSetProperty(g_vts, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
+    OSStatus pst = VTSessionSetProperty(g_vts, kVTCompressionPropertyKey_ProfileLevel,
+        lowLat ? kVTProfileLevel_H264_ConstrainedHigh_AutoLevel : kVTProfileLevel_H264_High_AutoLevel);
+    if (pst != noErr) VTSessionSetProperty(g_vts, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
     VTSessionSetProperty(g_vts, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse); // no B-frames => low latency
     VTSessionSetProperty(g_vts, kVTCompressionPropertyKey_MaximizePowerEfficiency, kCFBooleanFalse);
     setNum(kVTCompressionPropertyKey_ExpectedFrameRate, g_fps);
@@ -301,8 +517,8 @@ static BOOL startH264Encoder(void) {
     CVReturn pr = CVPixelBufferPoolCreate(NULL, (__bridge CFDictionaryRef)poolAttrs,
                                           (__bridge CFDictionaryRef)pbAttrs, &g_pbPool);
     if (pr != kCVReturnSuccess) fprintf(stderr, "[h264] buffer pool create failed: %d (will alloc per-frame)\n", (int)pr);
-    fprintf(stderr, "[h264] encoder ready (%ux%u px, hw, High, %.0f Mbps, IDR on demand)\n",
-            g_pixW, g_pixH, bps / 1e6);
+    fprintf(stderr, "[h264] encoder ready (%ux%u px, hw, High, %.0f Mbps, IDR on demand%s)\n",
+            g_pixW, g_pixH, bps / 1e6, lowLat ? ", low-latency mode" : "");
     return YES;
 }
 
@@ -388,28 +604,40 @@ static void processFrame(CVPixelBufferRef pb) {
             g_encFps = g_captureFps;
             lastCount = g_capFrames; lastTick = now;
         }
+        g_lastRealNs = nowNs();
+        g_repeatsSinceReal = 0;
         if (encoderWanted()) vtSubmit(pb);
     }
 }
 
-// Push capture is damage-driven: a static screen yields no frames. Re-submit the
-// last frame (a) immediately when an IDR is requested (new client / resync) and
-// (b) a few times per second while idle — near-free P-frames that let the encoder
-// refine a static desktop to full sharpness.
+// Push capture is damage-driven: a static screen yields no frames. The last frame
+// is re-submitted:
+//  (a) immediately when an IDR is requested (new client / resync);
+//  (b) twice, right after motion stops: hardware decoders (Android MediaCodec)
+//      release frame N only once frame N+1 arrives, so without this the final
+//      cursor position would sit invisible in the decoder until the next refresh;
+//  (c) every 250ms while idle — near-free P-frames that refine a static desktop.
 static void *refreshThread(void *arg) {
     (void)arg;
+    const uint64_t frameNs = (uint64_t)(1e9 / g_fps);
     while (g_running) {
-        usleep(15000);
+        usleep(4000);
         if (!g_encQ || !encoderWanted()) continue;
-        uint64_t since = nowNs() - g_lastSubmitNs;
-        if (!(g_forceKey && since > 8000000ULL) && since < 250000000ULL) continue;
+        uint64_t now = nowNs(), since = now - g_lastSubmitNs;
+        BOOL want = NO;
+        if (g_forceKey && since > 8000000ULL) want = YES;
+        else if (g_repeatsSinceReal < 2 && now - g_lastRealNs > 2 * frameNs && since > frameNs) want = YES;
+        else if (since > 250000000ULL) want = YES;
+        if (!want) continue;
         pthread_mutex_lock(&g_lock);
         CVPixelBufferRef pb = g_latestPB;
         if (pb) CFRetain(pb);
         pthread_mutex_unlock(&g_lock);
         if (!pb) continue;
+        g_repeatsSinceReal++;
+        g_lastSubmitNs = now;                       // don't queue duplicates while this one is pending
         dispatch_async(g_encQ, ^{
-            if (nowNs() - g_lastSubmitNs > 8000000ULL) vtSubmit(pb);   // a real frame may have just landed
+            if (nowNs() - g_lastRealNs > frameNs) vtSubmitEx(pb, YES);   // a real frame may have just landed
             CFRelease(pb);
         });
     }
@@ -683,8 +911,122 @@ static int listenSocket(uint16_t port) {
     return fd;
 }
 
+// ============================================================ TLS (HTTPS port)
+// Chrome only exposes WebCodecs (H.264 decode) to secure contexts. Serving HTTPS
+// with a local CA (certs.sh) makes https://<mac-ip>:8443 one — direct over Wi-Fi.
+// SecureTransport is deprecated but present and fits the blocking thread-per-
+// connection model; every connection thread keeps its TLS session in t_ssl so the
+// write helpers transparently encrypt.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static SecIdentityRef g_tlsIdentity = NULL;
+static CFArrayRef g_tlsChain = NULL;            // [identity, CA cert...]
+static uint16_t g_tlsPort = 0;
+static NSData *g_caCert = nil;                  // served at /ca.crt for installing on the Pad
+static __thread SSLContextRef t_ssl = NULL;
+
+static OSStatus sslReadCB(SSLConnectionRef c, void *data, size_t *len) {
+    int fd = (int)(intptr_t)c; size_t want = *len, got = 0;
+    while (got < want) {
+        ssize_t n = recv(fd, (char *)data + got, want - got, 0);
+        if (n > 0) { got += (size_t)n; continue; }
+        *len = got;
+        if (n == 0) return errSSLClosedGraceful;
+        if (errno == EINTR) continue;
+        return errSSLClosedAbort;
+    }
+    *len = got;
+    return noErr;
+}
+static OSStatus sslWriteCB(SSLConnectionRef c, const void *data, size_t *len) {
+    int fd = (int)(intptr_t)c; size_t want = *len, put = 0;
+    while (put < want) {
+        ssize_t n = write(fd, (const char *)data + put, want - put);
+        if (n > 0) { put += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        *len = put;
+        return errSSLClosedAbort;               // incl. SO_SNDTIMEO expiry: client stalled
+    }
+    *len = put;
+    return noErr;
+}
+
+static BOOL loadTLSIdentity(NSString *p12Path) {
+    NSData *p12 = [NSData dataWithContentsOfFile:p12Path];
+    if (!p12) return NO;
+    NSDictionary *opts = @{(__bridge id)kSecImportExportPassphrase: @"pad6display",
+                           (__bridge id)kSecImportToMemoryOnly: @YES};   // never touch the keychain
+    CFArrayRef items = NULL;
+    OSStatus st = SecPKCS12Import((__bridge CFDataRef)p12, (__bridge CFDictionaryRef)opts, &items);
+    if (st != errSecSuccess || !items || CFArrayGetCount(items) == 0) {
+        fprintf(stderr, "[tls] could not load %s (err %d)\n", p12Path.UTF8String, (int)st);
+        if (items) CFRelease(items);
+        return NO;
+    }
+    CFDictionaryRef item = CFArrayGetValueAtIndex(items, 0);
+    SecIdentityRef ident = (SecIdentityRef)CFDictionaryGetValue(item, kSecImportItemIdentity);
+    CFArrayRef chain = CFDictionaryGetValue(item, kSecImportItemCertChain);
+    if (!ident) { CFRelease(items); return NO; }
+    NSMutableArray *arr = [NSMutableArray arrayWithObject:(__bridge id)ident];
+    if (chain) for (CFIndex i = 1; i < CFArrayGetCount(chain); i++)   // [0] is the leaf itself
+        [arr addObject:(__bridge id)CFArrayGetValueAtIndex(chain, i)];
+    g_tlsIdentity = (SecIdentityRef)CFRetain(ident);
+    g_tlsChain = (CFArrayRef)CFBridgingRetain([arr copy]);
+    CFRelease(items);
+    return YES;
+}
+
+static BOOL tlsAccept(int fd) {
+    SSLContextRef ctx = SSLCreateContext(NULL, kSSLServerSide, kSSLStreamType);
+    if (!ctx) return NO;
+    SSLSetIOFuncs(ctx, sslReadCB, sslWriteCB);
+    SSLSetConnection(ctx, (SSLConnectionRef)(intptr_t)fd);
+    SSLSetProtocolVersionMin(ctx, kTLSProtocol12);
+    SSLSetCertificate(ctx, g_tlsChain);
+    OSStatus st;
+    do { st = SSLHandshake(ctx); } while (st == errSSLWouldBlock);
+    if (st != noErr) {
+        // -9806/-9805 here usually = the browser closed the socket after showing its
+        // certificate warning (CA not installed on the Pad yet) — harmless
+        static int logged = 0;
+        if (st != errSSLClosedAbort && st != errSSLClosedGraceful && (getenv("PAD6_DEBUG") || !logged++))
+            fprintf(stderr, "[tls] handshake rejected (%d) — client doesn't trust the cert yet? "
+                            "install it: ./adb-launch.sh --install-ca\n", (int)st);
+        CFRelease(ctx);
+        return NO;
+    }
+    t_ssl = ctx;
+    return YES;
+}
+
+static ssize_t connRecv(int fd, void *buf, size_t len) {
+    if (!t_ssl) return recv(fd, buf, len, 0);
+    size_t got = 0;
+    OSStatus st = SSLRead(t_ssl, buf, len, &got);
+    if (got > 0) return (ssize_t)got;
+    return st == noErr ? 0 : -1;
+}
+
+static void closeConn(int fd) {
+    if (t_ssl) { SSLClose(t_ssl); CFRelease(t_ssl); t_ssl = NULL; }
+    close(fd);
+}
+
 static BOOL writeAll(int fd, const void *buf, size_t len) {
     const char *p = buf;
+    if (t_ssl) {
+        while (len > 0) {
+            size_t done = 0;
+            OSStatus st = SSLWrite(t_ssl, p, len, &done);
+            p += done; len -= done;
+            if (st != noErr && !(st == errSSLWouldBlock && done > 0)) {
+                if (len && getenv("PAD6_DEBUG")) fprintf(stderr, "[tls] write failed: status %d errno %d (%s), %zu bytes left\n",
+                                 (int)st, errno, strerror(errno), len);
+                return len == 0;
+            }
+        }
+        return YES;
+    }
     while (len > 0) {
         ssize_t n = write(fd, p, len);
         if (n <= 0) { if (errno == EINTR) continue; return NO; }
@@ -692,10 +1034,11 @@ static BOOL writeAll(int fd, const void *buf, size_t len) {
     }
     return YES;
 }
+#pragma clang diagnostic pop
 static BOOL writeStr(int fd, const char *s) { return writeAll(fd, s, strlen(s)); }
 
 // print reachable URLs for every live IPv4 interface (IP changes with Wi-Fi networks)
-static void printLocalURLs(uint16_t port) {
+static void printLocalURLs(const char *scheme, uint16_t port) {
     struct ifaddrs *ifs = NULL, *it;
     if (getifaddrs(&ifs) != 0) return;
     for (it = ifs; it; it = it->ifa_next) {
@@ -705,18 +1048,20 @@ static void printLocalURLs(uint16_t port) {
         char ip[64];
         struct sockaddr_in *sa = (struct sockaddr_in *)it->ifa_addr;
         if (!inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip))) continue;
-        printf("  -> http://%s:%u/   (%s)\n", ip, port, it->ifa_name);
+        printf("  -> %s://%s:%u/   (%s)\n", scheme, ip, port, it->ifa_name);
     }
     freeifaddrs(ifs);
 }
-static BOOL writeRec(int fd, uint8_t flags, NSData *payload) { // [4B len][1B flags][payload]
+// [4B len][1B flags][8B capture time, wall-clock µs][payload]   (len = payload bytes)
+static BOOL writeRec(int fd, uint8_t flags, int64_t tsUs, NSData *payload) {
     size_t L = payload.length;
-    uint8_t *buf = malloc(5 + L);                    // one write = one TCP segment train
+    uint8_t *buf = malloc(13 + L);                   // one write = one TCP segment train
     if (!buf) return NO;
     buf[0] = (uint8_t)(L >> 24); buf[1] = (uint8_t)(L >> 16);
     buf[2] = (uint8_t)(L >> 8);  buf[3] = (uint8_t)L; buf[4] = flags;
-    if (L) memcpy(buf + 5, payload.bytes, L);
-    BOOL ok = writeAll(fd, buf, 5 + L);
+    for (int i = 0; i < 8; i++) buf[5 + i] = (uint8_t)((uint64_t)tsUs >> (56 - 8 * i));
+    if (L) memcpy(buf + 13, payload.bytes, L);
+    BOOL ok = writeAll(fd, buf, 13 + L);
     free(buf);
     return ok;
 }
@@ -807,11 +1152,28 @@ static const char *INDEX_HTML =
 "const WC=('VideoDecoder' in window);\n"
 "let alive=false,mode='',fpsN=0,fpsT=0,fps=0,showStats=false,info='';\n"
 "if(!WC){const w=$('warn');w.style.display='block';\n"
-" w.innerHTML='&#9888; Sharp low-latency H.264 is blocked: Chrome only allows its video decoder on secure pages, and this is plain http.<br>'+\n"
-" 'Falling back to MJPEG (blurry + laggy).<br><br><b>Fix (once):</b> run <code>./adb-launch.sh</code> on the Mac &mdash; or open '+\n"
-" '<code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>, add <code>'+location.origin+'</code>, Enable, Relaunch.';}\n"
-"function report(){fetch('/hello?mode='+mode+'&secure='+(window.isSecureContext?1:0)+'&screen='+\n"
-" Math.round(screen.width*devicePixelRatio)+'x'+Math.round(screen.height*devicePixelRatio)+'&dpr='+devicePixelRatio,{cache:'no-store'}).catch(()=>{});}\n"
+" w.innerHTML='&#9888; Sharp low-latency H.264 needs a secure page. Falling back to MJPEG (blurry + laggy).';\n"
+" fetch('/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{if(!j.tls_port)return;\n"
+"  const u='https://'+location.hostname+':'+j.tls_port+'/';\n"
+"  if(!sessionStorage.triedTls){sessionStorage.triedTls=1;location.replace(u);return;}\n"
+"  w.innerHTML+='<br><br>Open the secure page: <a style=\"color:#8cf\" href=\"'+u+'\">'+u+'</a><br>'+\n"
+"   'Certificate warning there? Install the CA once: <code>./adb-launch.sh --install-ca</code> on the Mac, '+\n"
+"   'or download <a style=\"color:#8cf\" href=\"/ca.crt\">ca.crt</a> and add it under Settings &rarr; Security &rarr; Encryption &amp; credentials &rarr; Install a certificate &rarr; CA certificate.';\n"
+" }).catch(()=>{});}\n"
+"function report(x){fetch('/hello?mode='+mode+'&secure='+(window.isSecureContext?1:0)+'&screen='+\n"
+" Math.round(screen.width*devicePixelRatio)+'x'+Math.round(screen.height*devicePixelRatio)+'&dpr='+devicePixelRatio+(x||''),{cache:'no-store'}).catch(()=>{});}\n"
+"// latency instrumentation: frames carry their Mac capture time; clock offset via /time\n"
+"let off=0,latA=[],latS=[],lastRep=0,lastSend=0,finalLat=0;const rep=new Set();\n"
+"const srvNow=()=>performance.timeOrigin+performance.now()+off;\n"
+"async function clockSync(){let best=1e9;for(let i=0;i<6;i++){const t0=performance.now();\n"
+" const v=+(await (await fetch('/time',{cache:'no-store'})).text());const t1=performance.now();\n"
+" if(t1-t0<best){best=t1-t0;off=v/1000-(performance.timeOrigin+(t0+t1)/2);}}}\n"
+"const med=a=>{if(!a.length)return 0;const b=[...a].sort((x,y)=>x-y);return Math.round(b[b.length>>1]);};\n"
+"function latTick(q){const t=performance.now();if(t-lastRep<1000)return;\n"
+" const A=med(latA),S=med(latS);latA=[];latS=[];\n"
+" info=cvInfo+'\\nlatency: arrive '+A+'ms  shown '+S+'ms  last '+Math.round(finalLat)+'ms  q'+q;draw();\n"
+" if(t-lastSend>5000){lastSend=t;report('&arrive_ms='+A+'&shown_ms='+S+'&last_ms='+Math.round(finalLat)+'&fps='+fps+'&decq='+q);}lastRep=t;}\n"
+"let cvInfo='';\n"
 "function draw(){st.textContent=showStats?(mode+' '+fps+' fps\\n'+info):'';}\n"
 "function tick(){fpsN++;const t=performance.now();if(t-fpsT>=1000){fps=fpsN;fpsN=0;fpsT=t;draw();}}\n"
 "const b64u8=b=>Uint8Array.from(atob(b),c=>c.charCodeAt(0));\n"
@@ -824,7 +1186,8 @@ static const char *INDEX_HTML =
 " take(k){const r=this.b.slice(this.o,this.o+k);this.o+=k;if(this.o===this.n){this.o=this.n=0;}return r;}}\n"
 "async function startH264(){\n"
 " const res=await fetch('/h264',{cache:'no-store'});if(!res.ok||!res.body)throw new Error('no h264');\n"
-" const rd=res.body.getReader();const buf=new Buf();let cfg=null,dec=null,g=null,bad=false,ts=0;\n"
+" await clockSync().catch(()=>{});\n"
+" const rd=res.body.getReader();const buf=new Buf();let cfg=null,dec=null,g=null,bad=false;\n"
 " try{\n"
 "  while(alive&&!bad){\n"
 "   const {done,value}=await rd.read();if(done)break;buf.push(value);\n"
@@ -832,16 +1195,17 @@ static const char *INDEX_HTML =
 "    buf.take(4);cfg=JSON.parse(new TextDecoder().decode(buf.take(L)));\n"
 "    if(cv.width!==cfg.w||cv.height!==cfg.h){cv.width=cfg.w;cv.height=cfg.h;}\n"
 "    g=cv.getContext('2d',{alpha:false,desynchronized:true});\n"
-"    dec=new VideoDecoder({output:f=>{g.drawImage(f,0,0,cv.width,cv.height);f.close();tick();},\n"
-"     error:e=>{console.warn(e);bad=true;}});\n"
+"    dec=new VideoDecoder({output:f=>{g.drawImage(f,0,0,cv.width,cv.height);if(rep.delete(f.timestamp)){}else{finalLat=srvNow()-f.timestamp/1000;latS.push(finalLat);}f.close();tick();latTick(dec.decodeQueueSize);},\n"
+"     error:e=>{console.warn(e);bad=true;report('&err='+encodeURIComponent('decoder: '+e.message));}});\n"
 "    const c={codec:cfg.codec,description:b64u8(cfg.desc),optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'};\n"
 "    try{if(!(await VideoDecoder.isConfigSupported(c)).supported)delete c.hardwareAcceleration;}catch(e){delete c.hardwareAcceleration;}\n"
 "    dec.configure(c);cv.style.display='block';img.style.display='none';\n"
-"    info=cfg.w+'x'+cfg.h+' '+cfg.codec;report();\n"
+"    cvInfo=info=cfg.w+'x'+cfg.h+' '+cfg.codec;report();\n"
 "   }\n"
-"   while(buf.have()>=5){const L=buf.u32(0);if(buf.have()<5+L)break;\n"
-"    const fl=buf.b[buf.o+4];buf.take(5);const data=buf.take(L);\n"
-"    if(L>0&&dec.state==='configured'){ts+=16667;dec.decode(new EncodedVideoChunk({type:(fl&1)?'key':'delta',timestamp:ts,data}));}\n"
+"   while(buf.have()>=13){const L=buf.u32(0);if(buf.have()<13+L)break;\n"
+"    const fl=buf.b[buf.o+4],ts=buf.u32(5)*4294967296+buf.u32(9);buf.take(13);const data=buf.take(L);\n"
+"    if(fl&2)rep.add(ts);else latA.push(srvNow()-ts/1000);\n"
+"    if(L>0&&dec.state==='configured')dec.decode(new EncodedVideoChunk({type:(fl&1)?'key':'delta',timestamp:ts,data}));\n"
 "   }\n"
 "  }\n"
 " }finally{try{rd.cancel();}catch(e){}try{if(dec&&dec.state!=='closed')dec.close();}catch(e){}}\n"
@@ -852,7 +1216,7 @@ static const char *INDEX_HTML =
 "async function start(){\n"
 " alive=true;st.style.display='block';\n"
 " if(WC){mode='h264';\n"
-"  while(alive){try{await startH264();}catch(e){console.warn(e);}\n"
+"  while(alive){try{await startH264();}catch(e){console.warn(e);report('&err='+encodeURIComponent(String(e&&e.message||e)));}\n"
 "   if(!alive)break;await new Promise(r=>setTimeout(r,500));}\n"
 " } else startMjpeg();\n"
 "}\n"
@@ -872,19 +1236,20 @@ static const char *INDEX_HTML =
 "</script></body></html>\n";
 
 // ============================================================ handlers
-static void handleClient(int fd) {
+static void handleClient(int fd, BOOL tls) {
     @autoreleasepool {
-        char req[2048] = {0};
-        ssize_t n = recv(fd, req, sizeof(req) - 1, 0);
-        if (n <= 0) { close(fd); return; }
+        if (tls && !tlsAccept(fd)) { close(fd); return; }
+        char req[4096] = {0};
+        ssize_t n = connRecv(fd, req, sizeof(req) - 1);
+        if (n <= 0) { closeConn(fd); return; }
         char method[16] = {0}, path[256] = {0}, query[256] = {0};
         sscanf(req, "%15s %255s", method, path);
         char *q = strchr(path, '?'); if (q) { snprintf(query, sizeof(query), "%s", q + 1); *q = 0; }
         char ua[256] = {0};
         char *uh = strcasestr(req, "User-Agent:");
         if (uh) sscanf(uh + 11, "%255[^\r\n]", ua);
-        if (strcmp(path, "/hello") != 0)
-            fprintf(stderr, "[http] GET %s%s%s\n", path, ua[0] ? "  UA=" : "", ua);
+        if (strcmp(path, "/hello") != 0 && strcmp(path, "/time") != 0)
+            fprintf(stderr, "[%s] GET %s%s%s\n", tls ? "https" : "http", path, ua[0] ? "  UA=" : "", ua);
 
         if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
             char hdr[256];
@@ -892,6 +1257,24 @@ static void handleClient(int fd) {
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %zu\r\n"
                 "Cache-Control: no-store\r\nConnection: close\r\n\r\n", strlen(INDEX_HTML));
             writeStr(fd, hdr); writeStr(fd, INDEX_HTML);
+        }
+        else if (strcmp(path, "/ca.crt") == 0) {
+            if (!g_caCert) writeStr(fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            else {
+                char hdr[256];
+                snprintf(hdr, sizeof(hdr),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-x509-ca-cert\r\n"
+                    "Content-Disposition: attachment; filename=\"pad6display-ca.crt\"\r\n"
+                    "Content-Length: %lu\r\nConnection: close\r\n\r\n", (unsigned long)g_caCert.length);
+                writeStr(fd, hdr); writeAll(fd, g_caCert.bytes, g_caCert.length);
+            }
+        }
+        else if (strcmp(path, "/time") == 0) {
+            char body[64], hdr[160];
+            snprintf(body, sizeof(body), "%lld", (long long)(clock_gettime_nsec_np(CLOCK_REALTIME) / 1000));
+            snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\n"
+                     "Content-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body));
+            writeStr(fd, hdr); writeStr(fd, body);
         }
         else if (strcmp(path, "/hello") == 0) {
             fprintf(stderr, "[client] %s%s\n", query,
@@ -945,7 +1328,7 @@ static void handleClient(int fd) {
                     sent++;
                 }
             }
-            fprintf(stderr, "[http] mjpeg client done (%d frames)\n", sent);
+            fprintf(stderr, "[stream] mjpeg client done (%d frames)\n", sent);
             __sync_fetch_and_sub(&g_mjpegClients, 1);
         }
         else if (strcmp(path, "/h264") == 0) {
@@ -961,7 +1344,7 @@ static void handleClient(int fd) {
             }
             if (!desc) {
                 writeStr(fd, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
-                __sync_fetch_and_sub(&g_h264Clients, 1); close(fd); return;
+                __sync_fetch_and_sub(&g_h264Clients, 1); closeConn(fd); return;
             }
             NSString *cfg = [NSString stringWithFormat:
                 @"{\"codec\":\"%@\",\"desc\":\"%@\",\"w\":%u,\"h\":%u,\"fps\":%.0f}",
@@ -976,7 +1359,7 @@ static void handleClient(int fd) {
             if (!writeStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
                               "Cache-Control: no-store\r\nConnection: close\r\n\r\n") ||
                 !writeAll(fd, cl, 4) || !writeAll(fd, cfgData.bytes, cfgData.length)) {
-                __sync_fetch_and_sub(&g_h264Clients, 1); close(fd); return;
+                __sync_fetch_and_sub(&g_h264Clients, 1); closeConn(fd); return;
             }
 
             // Start at the first keyframe produced after connect. If the client falls
@@ -988,7 +1371,7 @@ static void handleClient(int fd) {
             uint64_t lastSent = 0;
             BOOL primed = NO;
             int sent = 0, resyncs = 0;
-            NSData *out[64]; uint8_t fl[64];
+            NSData *out[64]; uint8_t fl[64]; int64_t tss[64];
             while (g_running) {
                 @autoreleasepool {
                     int cnt = 0;
@@ -1007,7 +1390,7 @@ static void handleClient(int fd) {
                             for (uint64_t s = lastSent + 1; s <= g_auHead && cnt < 64; s++) {
                                 AURec *r = &g_au[s % AU_RING];
                                 if (r->seq != s) continue;
-                                out[cnt] = r->data; fl[cnt] = r->isKey ? 1 : 0; cnt++;
+                                out[cnt] = r->data; fl[cnt] = (r->isKey ? 1 : 0) | (r->isRepeat ? 2 : 0); tss[cnt] = r->ptsUs; cnt++;
                                 lastSent = s;
                             }
                         }
@@ -1020,25 +1403,25 @@ static void handleClient(int fd) {
                     }
                     pthread_mutex_unlock(&g_lock);
                     BOOL ok = YES;
-                    for (int i = 0; i < cnt && ok; i++) ok = writeRec(fd, fl[i], out[i]);
+                    for (int i = 0; i < cnt && ok; i++) ok = writeRec(fd, fl[i], tss[i], out[i]);
                     for (int i = 0; i < cnt; i++) out[i] = nil;
                     if (!ok) break;
                     sent += cnt;
                 }
             }
-            fprintf(stderr, "[http] h264 client done (%d AUs, %d lag resyncs)\n", sent, resyncs);
+            fprintf(stderr, "[stream] h264 client done (%d AUs, %d lag resyncs)\n", sent, resyncs);
             __sync_fetch_and_sub(&g_h264Clients, 1);
         }
         else if (strcmp(path, "/status") == 0) {
-            char body[512], hdr[128];
+            char body[1024], hdr[128];
             pthread_mutex_lock(&g_lock);
             NSString *b = [NSString stringWithFormat:
                 @"{\"display\":%u,\"width\":%u,\"height\":%u,\"pixel_width\":%u,\"pixel_height\":%u,"
                 @"\"capture\":\"%s\",\"capture_fps\":%.1f,\"encode_fps\":%.1f,"
-                @"\"sc_callbacks\":%llu,\"h264_total_kbits\":%llu,\"mjpeg_clients\":%d,\"h264_clients\":%d,\"h264\":%@}",
+                @"\"tls_port\":%u,\"sc_callbacks\":%llu,\"h264_total_kbits\":%llu,\"mjpeg_clients\":%d,\"h264_clients\":%d,\"h264\":%@}",
                 g_displayID, g_dispW, g_dispH, g_pixW, g_pixH,
                 g_scStream ? "screencapturekit" : (g_cgStream ? "cgdisplaystream" : "polling"),
-                g_captureFps, g_encFps, (unsigned long long)g_scCallbacks,
+                g_captureFps, g_encFps, (unsigned)g_tlsPort, (unsigned long long)g_scCallbacks,
                 (unsigned long long)(g_h264Bytes * 8 / 1000), g_mjpegClients, g_h264Clients,
                 g_vts ? @"true" : @"false"];
             pthread_mutex_unlock(&g_lock);
@@ -1051,14 +1434,17 @@ static void handleClient(int fd) {
         else {
             writeStr(fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
         }
-        close(fd);
+        closeConn(fd);
     }
 }
 
-void *handleClientWrapper(void *fdp) { handleClient(*(int *)fdp); free(fdp); return NULL; }
+typedef struct { int fd; BOOL tls; } ConnArg;
+void *handleClientWrapper(void *p) { ConnArg a = *(ConnArg *)p; free(p); handleClient(a.fd, a.tls); return NULL; }
 
+typedef struct { int lfd; BOOL tls; } ListenArg;
 static void *serverThread(void *arg) {
-    int lfd = *(int *)arg;
+    ListenArg la = *(ListenArg *)arg; free(arg);
+    int lfd = la.lfd;
     while (g_running) {
         struct sockaddr_in cli; socklen_t cl = sizeof(cli);
         int fd = accept(lfd, (struct sockaddr *)&cli, &cl);
@@ -1068,9 +1454,10 @@ static void *serverThread(void *arg) {
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));   // no Nagle: frames leave immediately
         struct timeval tv = {10, 0};
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));      // stalled handshakes/requests can't pin a thread
         pthread_t t;
-        int *argfd = malloc(sizeof(int)); *argfd = fd;
-        pthread_create(&t, NULL, handleClientWrapper, argfd);
+        ConnArg *ca = malloc(sizeof(ConnArg)); ca->fd = fd; ca->tls = la.tls;
+        pthread_create(&t, NULL, handleClientWrapper, ca);
         pthread_detach(t);
     }
     return NULL;
@@ -1085,10 +1472,10 @@ int main(int argc, char **argv) {
     uint32_t w = argc > 1 ? (uint32_t)atoi(argv[1]) : 1440;
     uint32_t h = argc > 2 ? (uint32_t)atoi(argv[2]) : 900;
     uint16_t port = argc > 3 ? (uint16_t)atoi(argv[3]) : 8080;
-    g_fps = argc > 4 ? atof(argv[4]) : 60.0;
+    g_fps = argc > 4 ? atof(argv[4]) : 120.0;   // Pad 6 panel is 144Hz: 120 halves per-frame latency
     BOOL hiDPI = !(getenv("PAD6_SCALE") && atoi(getenv("PAD6_SCALE")) == 1);
     if (!w || !h || !port || g_fps < 1 || g_fps > 120) {
-        fprintf(stderr, "usage: %s [width_pt height_pt [port [fps]]]   (default 1440 900 8080 60)\n", argv[0]);
+        fprintf(stderr, "usage: %s [width_pt height_pt [port [fps]]]   (default 1440 900 8080 120)\n", argv[0]);
         return 2;
     }
 
@@ -1136,8 +1523,31 @@ int main(int argc, char **argv) {
 
     int lfd = listenSocket(port);
     if (lfd < 0) return 1;
-    printf("serving — open on the Pad (best: ./adb-launch.sh, enables sharp H.264):\n");
-    printLocalURLs(port);
+
+    // HTTPS: certs.sh (run by run.sh) keeps certs/server.p12 valid for the current IPs
+    int tfd = -1;
+    {
+        const char *tp = getenv("PAD6_TLS_PORT");
+        uint16_t tlsPort = tp ? (uint16_t)atoi(tp) : (uint16_t)(port + 363);   // 8080 -> 8443
+        NSString *certDir = [exeDir stringByAppendingPathComponent:@"certs"];
+        g_caCert = [NSData dataWithContentsOfFile:[certDir stringByAppendingPathComponent:@"ca.crt"]];
+        if (tlsPort && loadTLSIdentity([certDir stringByAppendingPathComponent:@"server.p12"])) {
+            tfd = listenSocket(tlsPort);
+            if (tfd >= 0) g_tlsPort = tlsPort;
+        } else if (tlsPort) {
+            fprintf(stderr, "[tls] no certs/server.p12 — HTTPS disabled (run ./certs.sh)\n");
+        }
+    }
+
+    if (g_tlsPort) {
+        printf("serving — open on the Pad (secure = sharp H.264, direct over Wi-Fi):\n");
+        printLocalURLs("https", g_tlsPort);
+        printf("  first time: install the CA on the Pad -> ./adb-launch.sh --install-ca\n");
+        printf("  plain http (MJPEG fallback / adb tunnel) on :%u\n", port);
+    } else {
+        printf("serving — open on the Pad (best: ./adb-launch.sh, enables sharp H.264):\n");
+        printLocalURLs("http", port);
+    }
     fflush(stdout);
 
     if (getenv("PAD6_POLL")) {              // debug: skip push APIs entirely
@@ -1152,8 +1562,15 @@ int main(int argc, char **argv) {
         startPolling();
     }
     pthread_t srvT, jpgT, refT;
-    pthread_create(&srvT, NULL, serverThread, &lfd);
+    ListenArg *la = malloc(sizeof(ListenArg)); la->lfd = lfd; la->tls = NO;
+    pthread_create(&srvT, NULL, serverThread, la);
     pthread_detach(srvT);
+    if (tfd >= 0) {
+        pthread_t tlsT;
+        ListenArg *tla = malloc(sizeof(ListenArg)); tla->lfd = tfd; tla->tls = YES;
+        pthread_create(&tlsT, NULL, serverThread, tla);
+        pthread_detach(tlsT);
+    }
     pthread_create(&jpgT, NULL, jpegThread, NULL);
     pthread_detach(jpgT);
     pthread_create(&refT, NULL, refreshThread, NULL);
@@ -1165,8 +1582,8 @@ int main(int argc, char **argv) {
         if (!g_running) break;
         uint64_t b = g_h264Bytes, o = g_encOutFrames, cb = g_scCallbacks;
         if (g_h264Clients || g_mjpegClients || o != lastOut || getenv("PAD6_DEBUG"))
-            fprintf(stderr, "[status] capture=%.1ffps encout=%.1ffps h264=%.0fkbit/s clients(h264=%d mjpeg=%d) sccb=%llu%s\n",
-                    g_captureFps, (double)(o - lastOut) / 10.0, (double)(b - lastBytes) * 8 / 10000,
+            fprintf(stderr, "[status] capture=%.1ffps encout=%.1ffps enc=%.1fms h264=%.0fkbit/s clients(h264=%d mjpeg=%d) sccb=%llu%s\n",
+                    g_captureFps, (double)(o - lastOut) / 10.0, g_encLatMs, (double)(b - lastBytes) * 8 / 10000,
                     g_h264Clients, g_mjpegClients, (unsigned long long)(cb - lastCb),
                     g_capMs > 0 ? [NSString stringWithFormat:@" poll=%.0fms", g_capMs].UTF8String : "");
         lastBytes = b; lastOut = o; lastCb = cb;
@@ -1174,6 +1591,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "shutting down...\n");
     close(lfd);
+    if (tfd >= 0) close(tfd);
     if (g_scStream) {
         dispatch_semaphore_t done = dispatch_semaphore_create(0);
         [g_scStream stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; dispatch_semaphore_signal(done); }];

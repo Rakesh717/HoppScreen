@@ -13,19 +13,22 @@ Pad's **browser** (WebCodecs) over LAN. No apps installed on the Pad.
    -> VideoToolbox H.264 (hardware, High@5.2, ~28Mbps cap, no B-frames, IDR on demand)
    -> HTTP :8080
         /            player page (WebCodecs, MJPEG fallback, fullscreen+wakelock)
-        /h264        [4B len][JSON cfg] then [4B len][1B flags][AVCC AU]...
+        /h264        [4B len][JSON cfg] then [4B len][1B flags][8B capture µs][AVCC AU]...
+        /time        server clock (latency measurement)
         /stream.mjpg MJPEG multipart (fallback)
         /frame.jpg   single JPEG (debug)
         /status      JSON stats
-   -> adb reverse -> Pad 6 Chrome at http://localhost:8080 (secure context)
+        /ca.crt      local CA (install on the Pad once)
+   -> HTTPS :8443 (same endpoints, TLS) -> Pad 6 Chrome (secure context)
       -> WebCodecs VideoDecoder (hardware) -> <canvas>, optimizeForLatency
 ```
 
 ## Run
 
 ```bash
-./run.sh            # looks like 1440x900 (Retina, 2880x1800 px) @60fps, port 8080
-./adb-launch.sh     # opens it fullscreen on the Pad (sharp H.264 mode)
+./run.sh                     # looks like 1440x900 (Retina, 2880x1800 px) @120fps
+./adb-launch.sh --install-ca # ONE time: copy the local CA to the Pad + open cert settings
+./adb-launch.sh              # opens https://<mac-ip>:8443 fullscreen on the Pad
 ```
 
 Stop with **Ctrl-C**. That ends screen recording and removes the virtual display.
@@ -34,17 +37,54 @@ The encoder sleeps while no client is connected.
 Other sizes: `./run.sh 1680 1050` gives more space but smaller, slightly softer text.
 `PAD6_SCALE=1 ./run.sh 2880 1800` uses a non-Retina 1x mode with tiny text.
 
-**Why `adb-launch.sh` matters:** Chrome only allows its H.264 decoder (WebCodecs) on
-secure pages. Plain `http://192.168.x.x:8080` isn't secure, so the page falls back to
-MJPEG, which is blurry, about 24fps and high-latency. The script runs `adb reverse` so the Pad
-opens `http://localhost:8080`, which Chrome always treats as secure. It works over
-Wireless debugging. A USB-C cable gives the lowest latency.
-Without adb, open `chrome://flags/#unsafely-treat-insecure-origin-as-secure` on the Pad, add
-`http://<mac-ip>:8080`, relaunch Chrome, then `./adb-launch.sh --lan` (or type the URL).
-The page shows a warning when it's stuck on the fallback. The server log shows
-`[client] mode=h264&secure=1` when the sharp path is active.
+### Why HTTPS (port 8443)
+
+Chrome only allows its H.264 decoder (WebCodecs) on **secure** pages. Plain
+`http://192.168.x.x:8080` isn't secure, so the page falls back to MJPEG, which is blurry,
+about 24fps and laggy. The server also serves **HTTPS on port+363 (8443)**:
+
+- `certs.sh` (run automatically by `run.sh`) creates a private CA once (`certs/ca.crt`).
+  It then issues a server certificate for the Mac's current LAN IPs, and re-issues it
+  automatically when you change networks.
+- The CA is **name-constrained** to private IPs, `localhost` and `*.local`. Even if
+  `certs/ca.key` leaked, it couldn't be used to impersonate real websites. Keep `certs/`
+  private anyway.
+- Install `ca.crt` on the Pad once (`./adb-launch.sh --install-ca`, then Settings →
+  Encryption & credentials → Install a certificate → CA certificate). After that the
+  https page has no warnings. Without installing it, Chrome warns and **Advanced → Proceed** still works.
+- Opening the plain `http://…:8080` page redirects to https automatically.
+- TLS is macOS SecureTransport (TLS 1.2, ECDSA P-256 / AES-GCM). It adds no noticeable latency.
+
+Alternatives: `./adb-launch.sh --reverse` tunnels over adb to `http://localhost:8080`
+(also secure, no cert; best with a USB cable).
+The server log shows `[client] mode=h264&secure=1` when the sharp path is active.
 
 On the Pad, tap once to go fullscreen. Tap again to show or hide the fps overlay.
+
+## Latency (measured on the Pad, cursor motion, capture → on screen)
+
+| build | moving | final frame after you stop |
+|---|---|---|
+| before (std encoder, VT's default SPS) | ~255 ms | ~255 ms |
+| low-latency encoder @60 | ~61 ms | ~80 ms |
+| **low-latency encoder @120 (default)** | **~49–64 ms** | **~48–65 ms** |
+
+Tap the Pad screen to show the overlay. It has the same numbers: `arrive` is capture → bytes
+received, `shown` is capture → drawn, and `last` is the newest real frame. The page also reports
+them to the server log every 5s (`[client] … arrive_ms=… shown_ms=…`).
+
+What fixed it:
+- **Decoder frame holding.** VideoToolbox's standard SPS lacks VUI `bitstream_restriction`, so
+  the Pad's hardware decoder buffered up to about 9 frames. The server now rewrites the SPS
+  (`max_num_reorder_frames=0`), the same approach as WebRTC's `SpsVuiRewriter`. The low-latency
+  encoder already writes it.
+- **The final frame stuck in the decoder.** MediaCodec releases frame N only when N+1 arrives.
+  When motion stops, the server immediately sends 2 tiny repeat frames to push it out.
+- **Low-latency VideoToolbox mode** (`EnableLowLatencyRateControl`, Constrained High).
+- **120 fps** halves every per-frame wait. The Pad 6 panel runs at 144 Hz.
+
+Debug switches: `PAD6_LOWLAT=0` (standard encoder), `PAD6_NOVUI=1` (no SPS rewrite),
+`PAD6_DEBUG=1` (verbose).
 
 ## Notes (macOS 26 / M-series)
 
@@ -74,6 +114,7 @@ On the Pad, tap once to go fullscreen. Tap again to show or hide the fps overlay
 |---|---|
 | `virtualdisplay.h/.m` | Private `CGVirtualDisplay` wrapper (HiDPI) |
 | `server.m` | Capture chain + VideoToolbox encoder + HTTP + player page |
+| `certs.sh` | Local CA + per-IP server cert (HTTPS) |
 | `run.sh` / `adb-launch.sh` | build+run / auto-launch on the Pad |
 | `keeper.m`, `bench2.m` | Old experiments (not needed anymore) |
 | `vendor/` | Reference projects (macos-virtual-display-vnc etc.) |
