@@ -8,7 +8,6 @@ passwd
 
 # build outputs (rebuilt by make / clang)
 hoppscreen
-pad6display
 keeper
 bench2
 *.o

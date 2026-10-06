@@ -5,10 +5,6 @@ browser** (Chrome/Edge; tested on an Android tablet) — nothing to install on
 it. The Mac gets a **real virtual display**, streamed as **hardware H.264** to
 the receiver's browser (WebCodecs) over the LAN, with password protection.
 
-(Grew out of a Xiaomi Pad 6 project: the Pad's native Miracast sink is
-unreachable from macOS — it lives on a Wi-Fi Direct link Apple never exposed;
-verified by scan: no mDNS, no LAN ports, no P2P group visible.)
-
 ```
 [CGVirtualDisplay  looks like 1440x900 pt, HiDPI -> 2880x1800 px framebuffer]
    -> capture: ScreenCaptureKit push (cursor composited by WindowServer), 60fps
@@ -51,16 +47,16 @@ display to match that device's panel** — pixel-perfect for whatever opens it
 (a tablet, a phone, a laptop). The page measures its screen and refresh rate,
 calls `/fit`, and the server restarts itself with matching dimensions (same
 pid, ~2s blip, page reconnects automatically). Rate-limited to one refit per
-30s. `PAD6_AUTOFIT=0` disables; launching with an explicit size pins it:
+30s. `HOPPSCREEN_AUTOFIT=0` disables; launching with an explicit size pins it:
 
 ```bash
 make start                          # auto-fit on
 make start ARGS="1680 1050"         # pinned size, auto-fit off
-PAD6_AUTOFIT=1 make start ARGS="1680 1050"   # pinned + still auto-fit
+HOPPSCREEN_AUTOFIT=1 make start ARGS="1680 1050"   # pinned + still auto-fit
 ```
 
 Pinned sizes: `ARGS="1680 1050"` gives more space but smaller, slightly softer
-text. `PAD6_SCALE=1 ARGS="2880 1800"` uses a non-Retina 1x mode with tiny text.
+text. `HOPPSCREEN_SCALE=1 ARGS="2880 1800"` uses a non-Retina 1x mode with tiny text.
 `ARGS="1440 900 8080 60"` for 60fps (less load, ~15ms more lag).
 
 ### Why HTTPS (port 8443)
@@ -91,18 +87,18 @@ Anyone on the same Wi-Fi could open the page and watch, so **every endpoint**
 
 - On first start the server generates `passwd` next to the binary
   (`user:password`, one line, mode 600) and prints both. Change it by editing
-  the file and restarting. Or set it inline: `PAD6_PASSWORD=x make start`
+  the file and restarting. Or set it inline: `HOPPSCREEN_PASSWORD=x make start`
   (then any username is accepted).
-- The Pad's Chrome asks once, then caches the login for the origin and attaches
+- The receiver's browser asks once, then caches the login for the origin and attaches
   it to every request (page, `/h264`, `/stream.mjpg`) — streams are unaffected.
   If you change the password, reload the page: the 401 makes Chrome ask again.
 - Connections from this Mac (127.0.0.1) are exempt — no prompt.
 - Prefer the https URL: on plain http the password travels only base64-encoded
   (readable by a LAN sniffer); https encrypts it.
 
-On the Pad, tap once to go fullscreen. Tap again to show or hide the fps overlay.
+On the receiver, tap once to go fullscreen. Tap again to show or hide the fps overlay.
 
-## Latency (measured on the Pad, cursor motion, capture → on screen)
+## Latency (measured on an Android tablet, cursor motion, capture → on screen)
 
 | build | moving | final frame after you stop |
 |---|---|---|
@@ -110,22 +106,22 @@ On the Pad, tap once to go fullscreen. Tap again to show or hide the fps overlay
 | low-latency encoder @60 | ~61 ms | ~80 ms |
 | **low-latency encoder @120 (default)** | **~49–64 ms** | **~48–65 ms** |
 
-Tap the Pad screen to show the overlay. It has the same numbers: `arrive` is capture → bytes
+Tap the screen to show the overlay. It has the same numbers: `arrive` is capture → bytes
 received, `shown` is capture → drawn, and `last` is the newest real frame. The page also reports
 them to the server log every 5s (`[client] … arrive_ms=… shown_ms=…`).
 
 What fixed it:
 - **Decoder frame holding.** VideoToolbox's standard SPS lacks VUI `bitstream_restriction`, so
-  the Pad's hardware decoder buffered up to about 9 frames. The server now rewrites the SPS
+  the receiver's hardware decoder buffered up to about 9 frames. The server now rewrites the SPS
   (`max_num_reorder_frames=0`), the same approach as WebRTC's `SpsVuiRewriter`. The low-latency
   encoder already writes it.
 - **The final frame stuck in the decoder.** MediaCodec releases frame N only when N+1 arrives.
   When motion stops, the server immediately sends 2 tiny repeat frames to push it out.
 - **Low-latency VideoToolbox mode** (`EnableLowLatencyRateControl`, Constrained High).
-- **120 fps** halves every per-frame wait. The Pad 6 panel runs at 144 Hz.
+- **120 fps** halves every per-frame wait. High-refresh receiver panels (144 Hz) benefit most.
 
-Debug switches: `PAD6_LOWLAT=0` (standard encoder), `PAD6_NOVUI=1` (no SPS rewrite),
-`PAD6_DEBUG=1` (verbose).
+Debug switches: `HOPPSCREEN_LOWLAT=0` (standard encoder), `HOPPSCREEN_NOVUI=1` (no SPS rewrite),
+`HOPPSCREEN_DEBUG=1` (verbose).
 
 ## Notes (macOS 26 / M-series)
 
@@ -142,11 +138,11 @@ Debug switches: `PAD6_LOWLAT=0` (standard encoder), `PAD6_NOVUI=1` (no SPS rewri
 
 ## Troubleshooting
 
-- **Blurry / laggy / warning on the Pad page** → you're on the MJPEG fallback; open the
+- **Blurry / laggy / warning on the receiver page** → you're on the MJPEG fallback; open the
   `https://…:8443` URL instead and tap through the cert warning.
 - **Windows dragged to the display don't appear** → grant Screen Recording to your
   terminal app (System Settings → Privacy & Security → Screen Recording), restart server.
-- **Pad can't open the page** → run `make start` first; check same Wi-Fi and
+- **Receiver can't open the page** → run `make start` first; check same Wi-Fi and
   allow the macOS "Local Network" prompt.
 - **Black screen** → tap once; the page auto-reconnects.
 

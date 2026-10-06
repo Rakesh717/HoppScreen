@@ -1,12 +1,12 @@
 #!/bin/bash
 # certs.sh — local HTTPS certificates for HoppScreen (called by make run/start).
 #
-#  certs/ca.crt / ca.key   a private CA, created ONCE. Install ca.crt on the Pad
+#  certs/ca.crt / ca.key   a private CA, created ONCE. Install ca.crt on the receiver
 #                          (download it at http://<mac-ip>:8080/ca.crt) and
 #                          https://<mac-ip>:8443 is trusted with no warnings.
 #                          The CA is NAME-CONSTRAINED: it can only vouch for private
 #                          LAN IPs, localhost and *.local, so even a leaked ca.key can't
-#                          impersonate real websites to the Pad. Keep ca.key private anyway.
+#                          impersonate real websites to the receiver. Keep ca.key private anyway.
 #  certs/server.p12        leaf cert for this Mac's CURRENT private IPs. Re-issued
 #                          automatically whenever the IP set changes (new Wi-Fi etc.).
 set -e
@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 mkdir -p certs
 chmod 700 certs
 D=certs
-P12_PASS=pad6display
+P12_PASS=hoppscreen
 
 # private IPv4 addresses of this Mac (the constraints below only permit these ranges)
 IPS=$(ifconfig | awk '/inet /{print $2}' | grep -E '^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' | sort -u)
@@ -75,7 +75,7 @@ openssl x509 -req -in $D/server.csr -CA $D/ca.crt -CAkey $D/ca.key -CAcreateseri
   -days 397 -sha256 -extfile $D/server.cnf -extensions ext -out $D/server.crt 2>/dev/null
 # 3DES/SHA1 PKCS#12 encoding: readable by every macOS SecPKCS12Import version
 openssl pkcs12 -export -inkey $D/server.key -in $D/server.crt -certfile $D/ca.crt \
-  -name pad6display -passout pass:$P12_PASS \
+  -name hoppscreen -passout pass:$P12_PASS \
   -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 -out $D/server.p12
 chmod 600 $D/server.p12
 rm -f $D/server.csr

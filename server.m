@@ -13,7 +13,7 @@
 //                       a matching display size (see "auto-fit" section)
 //
 //   Every endpoint requires HTTP Basic auth (./passwd next to the binary, or
-//   PAD6_PASSWORD=<pw> env; loopback (this Mac) is exempt).
+//   HOPPSCREEN_PASSWORD=<pw> env; loopback (this Mac) is exempt).
 //
 //   clang -fobjc-arc -O2 -I. -framework Foundation -framework CoreGraphics \
 //       -framework AppKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
@@ -388,7 +388,7 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
     int64_t nowUp = (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000);
     g_encLatMs = g_encLatMs * 0.95 + ((nowUp - upUs) / 1000.0) * 0.05;
     int64_t ptsUs = realtimeUsFromUptimeUs(upUs);
-    if (!getenv("PAD6_NOVUI")) data = fixInbandSPS(data);
+    if (!getenv("HOPPSCREEN_NOVUI")) data = fixInbandSPS(data);
     len = data.length;
 
     pthread_mutex_lock(&g_lock);
@@ -408,7 +408,7 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
             CFDataRef avcC = atoms ? CFDictionaryGetValue(atoms, CFSTR("avcC")) : NULL;
             if (avcC && CFDataGetLength(avcC) >= 4) {
                 NSData *d = (__bridge NSData *)avcC;
-                NSData *fixed = getenv("PAD6_NOVUI") ? nil : fixAvcC(d);
+                NSData *fixed = getenv("HOPPSCREEN_NOVUI") ? nil : fixAvcC(d);
                 static BOOL said = NO;
                 if (!said) { said = YES;
                     fprintf(stderr, "[h264] SPS low-delay VUI rewrite: %s\n",
@@ -465,8 +465,8 @@ static void setNum(CFStringRef key, double v) {
 
 static BOOL startH264Encoder(void) {
     // Low-latency mode (the FaceTime path): the hardware encoder emits each frame as
-    // soon as it is coded instead of pipelining several. PAD6_LOWLAT=0 disables it.
-    BOOL lowLat = !(getenv("PAD6_LOWLAT") && atoi(getenv("PAD6_LOWLAT")) == 0);
+    // soon as it is coded instead of pipelining several. HOPPSCREEN_LOWLAT=0 disables it.
+    BOOL lowLat = !(getenv("HOPPSCREEN_LOWLAT") && atoi(getenv("HOPPSCREEN_LOWLAT")) == 0);
     NSMutableDictionary *encSpec = [@{
         (__bridge NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
         (__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
@@ -752,8 +752,8 @@ static void *captureWatchdog(void *arg) {
     [g_scStream stopCaptureWithCompletionHandler:nil];
     g_scStream = nil;
     if (!startCGStreamCapture()) { startPolling(); return NULL; }
-    if (getenv("PAD6_KEEP_PUSH")) {  // debug: hold push capture, never fall back
-        fprintf(stderr, "[cg] PAD6_KEEP_PUSH set — holding push capture\n");
+    if (getenv("HOPPSCREEN_KEEP_PUSH")) {  // debug: hold push capture, never fall back
+        fprintf(stderr, "[cg] HOPPSCREEN_KEEP_PUSH set — holding push capture\n");
         return NULL;
     }
     uint64_t last = g_capFrames;
@@ -935,7 +935,7 @@ static int listenSocket(uint16_t port) {
 static SecIdentityRef g_tlsIdentity = NULL;
 static CFArrayRef g_tlsChain = NULL;            // [identity, CA cert...]
 static uint16_t g_tlsPort = 0;
-static NSData *g_caCert = nil;                  // served at /ca.crt for installing on the Pad
+static NSData *g_caCert = nil;                  // served at /ca.crt for installing on the receiver
 static __thread SSLContextRef t_ssl = NULL;
 
 static OSStatus sslReadCB(SSLConnectionRef c, void *data, size_t *len) {
@@ -967,7 +967,7 @@ static OSStatus sslWriteCB(SSLConnectionRef c, const void *data, size_t *len) {
 static BOOL loadTLSIdentity(NSString *p12Path) {
     NSData *p12 = [NSData dataWithContentsOfFile:p12Path];
     if (!p12) return NO;
-    NSDictionary *opts = @{(__bridge id)kSecImportExportPassphrase: @"pad6display",
+    NSDictionary *opts = @{(__bridge id)kSecImportExportPassphrase: @"hoppscreen",
                            (__bridge id)kSecImportToMemoryOnly: @YES};   // never touch the keychain
     CFArrayRef items = NULL;
     OSStatus st = SecPKCS12Import((__bridge CFDataRef)p12, (__bridge CFDictionaryRef)opts, &items);
@@ -1000,11 +1000,11 @@ static BOOL tlsAccept(int fd) {
     do { st = SSLHandshake(ctx); } while (st == errSSLWouldBlock);
     if (st != noErr) {
         // -9806/-9805 here usually = the browser closed the socket after showing its
-        // certificate warning (CA not installed on the Pad yet) — harmless
+        // certificate warning (CA not installed on the receiver yet) — harmless
         static int logged = 0;
-        if (st != errSSLClosedAbort && st != errSSLClosedGraceful && (getenv("PAD6_DEBUG") || !logged++))
+        if (st != errSSLClosedAbort && st != errSSLClosedGraceful && (getenv("HOPPSCREEN_DEBUG") || !logged++))
             fprintf(stderr, "[tls] handshake rejected (%d) — client doesn't trust the cert yet? "
-                            "install certs/ca.crt on the Pad (README: 'Why HTTPS')\n", (int)st);
+                            "install certs/ca.crt on the receiver (README: 'Why HTTPS')\n", (int)st);
         CFRelease(ctx);
         return NO;
     }
@@ -1033,7 +1033,7 @@ static BOOL writeAll(int fd, const void *buf, size_t len) {
             OSStatus st = SSLWrite(t_ssl, p, len, &done);
             p += done; len -= done;
             if (st != noErr && !(st == errSSLWouldBlock && done > 0)) {
-                if (len && getenv("PAD6_DEBUG")) fprintf(stderr, "[tls] write failed: status %d errno %d (%s), %zu bytes left\n",
+                if (len && getenv("HOPPSCREEN_DEBUG")) fprintf(stderr, "[tls] write failed: status %d errno %d (%s), %zu bytes left\n",
                                  (int)st, errno, strerror(errno), len);
                 return len == 0;
             }
@@ -1131,7 +1131,7 @@ static void drawCursorOverlay(CGContextRef ctx) {
     CGFloat left   = (cg.x - vb.origin.x - hot.x) * scale;
     CGFloat topPx  = (cg.y - vb.origin.y - hot.y) * scale;    // from the top edge
     CGRect crect = CGRectMake(left, ctxH - topPx - ch, cw, ch); // bitmap context is y-up
-    if (getenv("PAD6_DEBUG")) {
+    if (getenv("HOPPSCREEN_DEBUG")) {
         static uint64_t lastDbg = 0; uint64_t t = nowNs();
         if (t - lastDbg > 500000000ULL) { lastDbg = t;
             fprintf(stderr, "[cursor] cg(%.1f,%.1f) vb(%.0f,%.0f %.0fx%.0f) hot(%.1f,%.1f) size %.0fx%.0f scale %.2f -> rect(%.1f,%.1f %.0fx%.0f)\n",
@@ -1259,11 +1259,11 @@ static const char *INDEX_HTML =
 
 // ============================================================ password protection
 // The server is reachable by anyone on the same Wi-Fi, so every endpoint
-// requires HTTP Basic auth. The Pad's browser asks once, remembers it for the
+// requires HTTP Basic auth. The receiver's browser asks once, remembers it for the
 // origin and attaches it to every following request (player page, /h264,
 // /stream.mjpg), so the streams keep working unchanged after login.
 //   credentials: first line of ./passwd next to the binary, "user:password"
-//   (auto-generated on first run, file mode 600), or PAD6_PASSWORD=<password>
+//   (auto-generated on first run, file mode 600), or HOPPSCREEN_PASSWORD=<password>
 //   env (any username). Connections from 127.0.0.1 (this Mac) are exempt.
 static NSData *g_authHash = nil;        // SHA256(password); nil = protection off
 static NSString *g_authUser = nil;      // required username, nil = any
@@ -1316,12 +1316,12 @@ static void peerIp(int fd, char *out, size_t n) {
 // VirtualDisplay's serial-retry loop handles the teardown race.
 //   - no args at launch  -> auto-fit ON
 //   - explicit W H args  -> auto-fit OFF (user pinned the size)
-//   - PAD6_AUTOFIT=0/1   -> force either way
+//   - HOPPSCREEN_AUTOFIT=0/1   -> force either way
 static uint16_t g_port = 0;
 static int g_httpFd = -1, g_tlsFd = -1;
 static BOOL g_autofit = NO;
 static char g_exePath[PATH_MAX] = {0};
-static time_t g_lastFit = 0;                 // survives re-execs via PAD6_LASTFIT
+static time_t g_lastFit = 0;                 // survives re-execs via HOPPSCREEN_LASTFIT
 
 static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) __attribute__((noreturn));
 static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) {
@@ -1329,13 +1329,13 @@ static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) {
             ptW, ptH, hiDPI ? "(HiDPI 2x)" : "(1x)", fps);
     fflush(stdout); fflush(stderr);
     // the new instance must use the scale decided here, whatever the env says
-    setenv("PAD6_SCALE", hiDPI ? "0" : "1", 1);          // "0" -> stays HiDPI
-    setenv("PAD6_AUTOFIT", "1", 1);                      // explicit args must NOT pin
+    setenv("HOPPSCREEN_SCALE", hiDPI ? "0" : "1", 1);          // "0" -> stays HiDPI
+    setenv("HOPPSCREEN_AUTOFIT", "1", 1);                      // explicit args must NOT pin
                                                           // the size after a refit
     {   // keep the refit rate-limit window across the exec
         char tS[24];
         snprintf(tS, sizeof tS, "%lld", (long long)g_lastFit);
-        setenv("PAD6_LASTFIT", tS, 1);
+        setenv("HOPPSCREEN_LASTFIT", tS, 1);
     }
     char wS[16], hS[16], pS[16], fS[16];
     snprintf(wS, sizeof wS, "%u", ptW);
@@ -1367,7 +1367,7 @@ static void handleClient(int fd, BOOL tls) {
             fprintf(stderr, "[%s] GET %s%s%s\n", tls ? "https" : "http", path, ua[0] ? "  UA=" : "", ua);
 
         // password gate — every endpoint, on both http and https. After the first
-        // successful login the Pad's browser caches the credentials and attaches
+        // successful login the receiver's browser caches the credentials and attaches
         // them to all requests (page, /h264, /stream.mjpg), so the player page
         // itself needs no changes. Connections from this Mac (127.0.0.1) are exempt.
         if (g_authHash && !isLoopbackPeer(fd) && !requestAuthorized(req)) {
@@ -1640,13 +1640,13 @@ static void onSig(int sig) { (void)sig; g_running = NO; }
 
 int main(int argc, char **argv) {
     // args are the LOGICAL ("looks like") size in points; the framebuffer is 2x that
-    // (Retina) unless PAD6_SCALE=1. Default 1440x900 pt = 2880x1800 px. With no
+    // (Retina) unless HOPPSCREEN_SCALE=1. Default 1440x900 pt = 2880x1800 px. With no
     // size args, auto-fit can recreate the display to match the first client.
     uint32_t w = argc > 1 ? (uint32_t)atoi(argv[1]) : 1440;
     uint32_t h = argc > 2 ? (uint32_t)atoi(argv[2]) : 900;
     uint16_t port = argc > 3 ? (uint16_t)atoi(argv[3]) : 8080;
     g_fps = argc > 4 ? atof(argv[4]) : 120.0;   // high-hz panels: 120 halves per-frame latency
-    BOOL hiDPI = !(getenv("PAD6_SCALE") && atoi(getenv("PAD6_SCALE")) == 1);
+    BOOL hiDPI = !(getenv("HOPPSCREEN_SCALE") && atoi(getenv("HOPPSCREEN_SCALE")) == 1);
     if (!w || !h || !port || g_fps < 1 || g_fps > 120) {
         fprintf(stderr, "usage: %s [width_pt height_pt [port [fps]]]   (default 1440 900 8080 120)\n", argv[0]);
         return 2;
@@ -1657,11 +1657,11 @@ int main(int argc, char **argv) {
         uint32_t n = (uint32_t)sizeof(g_exePath) - 1;
         if (_NSGetExecutablePath(g_exePath, &n) != 0) g_exePath[0] = 0;
     }
-    // auto-fit: on with no size args, off when the size was pinned; PAD6_AUTOFIT forces
+    // auto-fit: on with no size args, off when the size was pinned; HOPPSCREEN_AUTOFIT forces
     {
-        const char *af = getenv("PAD6_AUTOFIT");
+        const char *af = getenv("HOPPSCREEN_AUTOFIT");
         g_autofit = (argc > 1) ? (af && atoi(af) == 1) : !(af && atoi(af) == 0);
-        const char *lf = getenv("PAD6_LASTFIT");       // rate-limit window survives execs
+        const char *lf = getenv("HOPPSCREEN_LASTFIT");       // rate-limit window survives execs
         if (lf) g_lastFit = (time_t)atoll(lf);
     }
 
@@ -1698,7 +1698,7 @@ int main(int argc, char **argv) {
         printf("arranged right of existing displays: origin (%g, %g)\n", fb.origin.x, fb.origin.y);
     }
 
-    g_encQ = dispatch_queue_create("pad6.encode", dispatch_queue_attr_make_with_qos_class(
+    g_encQ = dispatch_queue_create("hoppscreen.encode", dispatch_queue_attr_make_with_qos_class(
                                        DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     if (!startH264Encoder()) fprintf(stderr, "continuing without h264 (mjpeg only)\n");
 
@@ -1709,9 +1709,9 @@ int main(int argc, char **argv) {
 
     // login credentials for the LAN (see the "password protection" section)
     {
-        const char *envPw = getenv("PAD6_PASSWORD");
+        const char *envPw = getenv("HOPPSCREEN_PASSWORD");
         NSString *user = nil, *pass = nil, *src = nil;
-        if (envPw && envPw[0]) { pass = @(envPw); src = @"PAD6_PASSWORD env, any username"; }
+        if (envPw && envPw[0]) { pass = @(envPw); src = @"HOPPSCREEN_PASSWORD env, any username"; }
         else {
             NSString *pwFile = [exeDir stringByAppendingPathComponent:@"passwd"];
             NSString *line = [[NSString stringWithContentsOfFile:pwFile encoding:NSUTF8StringEncoding error:nil]
@@ -1726,7 +1726,7 @@ int main(int argc, char **argv) {
                 static const char *abc = "abcdefghjkmnpqrstuvwxyz23456789";   // no 0/O, 1/l/I
                 NSMutableString *gen = [NSMutableString stringWithCapacity:8];
                 for (int i = 0; i < 8; i++) [gen appendFormat:@"%c", abc[arc4random_uniform((uint32_t)strlen(abc))]];
-                user = @"pad"; pass = gen;
+                user = @"hopp"; pass = gen;
                 if ([[NSString stringWithFormat:@"%@:%@\n", user, pass]
                         writeToFile:pwFile atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
                     chmod(pwFile.fileSystemRepresentation, 0600);
@@ -1750,7 +1750,7 @@ int main(int argc, char **argv) {
     // HTTPS: certs.sh (run by make) keeps certs/server.p12 valid for the current IPs
     int tfd = -1;
     {
-        const char *tp = getenv("PAD6_TLS_PORT");
+        const char *tp = getenv("HOPPSCREEN_TLS_PORT");
         uint16_t tlsPort = tp ? (uint16_t)atoi(tp) : (uint16_t)(port + 363);   // 8080 -> 8443
         NSString *certDir = [exeDir stringByAppendingPathComponent:@"certs"];
         g_caCert = [NSData dataWithContentsOfFile:[certDir stringByAppendingPathComponent:@"ca.crt"]];
@@ -1775,11 +1775,11 @@ int main(int argc, char **argv) {
     }
     printf("  auto-fit: %s\n", g_autofit ?
            "on — the display will match the first client's panel" :
-           "off — size pinned by launch args (PAD6_AUTOFIT=1 to enable)");
+           "off — size pinned by launch args (HOPPSCREEN_AUTOFIT=1 to enable)");
     fflush(stdout);
 
-    if (getenv("PAD6_POLL")) {              // debug: skip push APIs entirely
-        fprintf(stderr, "PAD6_POLL set — CGDisplayCreateImage polling loop\n");
+    if (getenv("HOPPSCREEN_POLL")) {              // debug: skip push APIs entirely
+        fprintf(stderr, "HOPPSCREEN_POLL set — CGDisplayCreateImage polling loop\n");
         startPolling();
     } else if (startSCCapture()) {
         pthread_t wd;
@@ -1809,7 +1809,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 10 && g_running; i++) sleep(1);
         if (!g_running) break;
         uint64_t b = g_h264Bytes, o = g_encOutFrames, cb = g_scCallbacks;
-        if (g_h264Clients || g_mjpegClients || o != lastOut || getenv("PAD6_DEBUG"))
+        if (g_h264Clients || g_mjpegClients || o != lastOut || getenv("HOPPSCREEN_DEBUG"))
             fprintf(stderr, "[status] capture=%.1ffps encout=%.1ffps enc=%.1fms h264=%.0fkbit/s clients(h264=%d mjpeg=%d) sccb=%llu%s\n",
                     g_captureFps, (double)(o - lastOut) / 10.0, g_encLatMs, (double)(b - lastBytes) * 8 / 10000,
                     g_h264Clients, g_mjpegClients, (unsigned long long)(cb - lastCb),

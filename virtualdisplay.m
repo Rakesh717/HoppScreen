@@ -67,21 +67,21 @@
     uint32_t scale = hiDPI ? 2 : 1;
     uint32_t pw = width * scale, ph = height * scale;
 
-    _queue = dispatch_queue_create("nz.watchful.virtualdisplay", DISPATCH_QUEUE_SERIAL);
+    _queue = dispatch_queue_create("hoppscreen.virtualdisplay", DISPATCH_QUEUE_SERIAL);
 
     CGVirtualDisplayDescriptor *desc = [[DescCls alloc] init];
     desc.queue = _queue;
-    // name shown in macOS display settings; override with PAD6_NAME=<str>
+    // name shown in macOS display settings; override with HOPPSCREEN_NAME=<str>
     NSString *dispName = @"HoppScreen Display";
-    const char *envName = getenv("PAD6_NAME");
+    const char *envName = getenv("HOPPSCREEN_NAME");
     if (envName && envName[0]) dispName = [NSString stringWithUTF8String:envName];
     desc.name = dispName;
     desc.vendorID = 0x1234;
     desc.productID = 0x1620;
     // stable serial: macOS remembers arrangement/settings instead of piling up a
-    // new "display" in its prefs on every run
-    desc.serialNum = 0x9AD60000u ^ (pw << 12) ^ ph;
-    // physical size of the Pad 6 panel (11", 16:10) -> correct reported DPI
+    // new "display" in its prefs on every run (0x48505053 = "HPPS")
+    desc.serialNum = 0x48505053u ^ (pw << 12) ^ ph;
+    // nominal 11-inch 16:10 panel size -> sane reported DPI for the mode hint
     desc.sizeInMillimeters = CGSizeMake(237, 148);
     desc.maxPixelsWide = pw;
     desc.maxPixelsHigh = ph;
