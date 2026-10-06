@@ -15,8 +15,8 @@ PORT    ?= 8080
 # that opens the page. Setting ARGS (e.g. ARGS="1680 1050") pins the size and
 # disables auto-fit.
 ARGS    ?=
-# audio: 1 = stream the Mac's system sound with the video (default), 0 = silent
-AUDIO   ?= 1
+# audio: 0 = stream the Mac's system sound with the video (default), 0 = silent
+AUDIO   ?= 0
 export HOPPSCREEN_AUDIO = $(AUDIO)
 
 .DEFAULT_GOAL := help
