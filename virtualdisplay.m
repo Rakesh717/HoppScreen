@@ -71,7 +71,11 @@
 
     CGVirtualDisplayDescriptor *desc = [[DescCls alloc] init];
     desc.queue = _queue;
-    desc.name = @"Pad 6 Display";
+    // name shown in macOS display settings; override with PAD6_NAME=<str>
+    NSString *dispName = @"HoppScreen Display";
+    const char *envName = getenv("PAD6_NAME");
+    if (envName && envName[0]) dispName = [NSString stringWithUTF8String:envName];
+    desc.name = dispName;
     desc.vendorID = 0x1234;
     desc.productID = 0x1620;
     // stable serial: macOS remembers arrangement/settings instead of piling up a

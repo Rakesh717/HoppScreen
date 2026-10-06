@@ -1,5 +1,5 @@
 #!/bin/bash
-# certs.sh — local HTTPS certificates for pad6display (called by make run/start).
+# certs.sh — local HTTPS certificates for HoppScreen (called by make run/start).
 #
 #  certs/ca.crt / ca.key   a private CA, created ONCE. Install ca.crt on the Pad
 #                          (download it at http://<mac-ip>:8080/ca.crt) and
@@ -29,8 +29,8 @@ distinguished_name = dn
 x509_extensions = v3_ca
 prompt = no
 [dn]
-CN = pad6display local CA
-O = pad6display
+CN = HoppScreen Local CA
+O = HoppScreen
 [v3_ca]
 basicConstraints = critical, CA:true, pathlen:0
 keyUsage = critical, keyCertSign, cRLSign
@@ -55,7 +55,7 @@ echo "[certs] issuing server certificate for: localhost $HOST.local $(echo $IPS)
   echo "distinguished_name = dn"
   echo "prompt = no"
   echo "[dn]"
-  echo "CN = pad6display"
+  echo "CN = hoppscreen"
   echo "[ext]"
   echo "basicConstraints = critical, CA:false"
   echo "keyUsage = critical, digitalSignature"

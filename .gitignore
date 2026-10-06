@@ -6,7 +6,8 @@ certs/
 # server login (auto-generated) — never commit
 passwd
 
-# build outputs (rebuilt by run.sh / clang)
+# build outputs (rebuilt by make / clang)
+hoppscreen
 pad6display
 keeper
 bench2

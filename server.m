@@ -1,4 +1,4 @@
-// pad6display — wireless display extender server (macOS -> Xiaomi Pad 6 browser)
+// HoppScreen — wireless display extender server (macOS -> any browser)
 // Pure ObjC, no deps.
 //   - Virtual display via private CGVirtualDisplay ObjC API (proven on macOS 26)
 //   - Capture via CGDisplayCreateImage (dlsym; header-obsoleted but functional)
@@ -9,15 +9,19 @@
 //       /stream.mjpg -> MJPEG multipart (fallback)
 //       /frame.jpg   -> single JPEG (debug)
 //       /status      -> JSON stats
+//       /fit         -> auto-fit: client reports its panel; server re-execs with
+//                       a matching display size (see "auto-fit" section)
 //
 //   Every endpoint requires HTTP Basic auth (./passwd next to the binary, or
 //   PAD6_PASSWORD=<pw> env; loopback (this Mac) is exempt).
 //
 //   clang -fobjc-arc -O2 -I. -framework Foundation -framework CoreGraphics \
 //       -framework AppKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
-//       server.m VirtualDisplay.m -o pad6display
+//       server.m VirtualDisplay.m -o hoppscreen
 //
-// Usage: pad6display [width_pt height_pt [port [fps]]]   defaults: 1440 900 8080 120 (HiDPI -> 2880x1800 px)
+// Usage: hoppscreen [width_pt height_pt [port [fps]]]
+//   No args -> 1440 900 8080 120 + AUTO-FIT ON (display matches the first client
+//   that opens the page). Explicit sizes pin the display and disable auto-fit.
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -42,6 +46,8 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <strings.h>
+#include <limits.h>
+#import <mach-o/dyld.h>
 #import "virtualdisplay.h"
 
 // ============================================================ shared state
@@ -1142,7 +1148,7 @@ static void drawCursorOverlay(CGContextRef ctx) {
 static const char *INDEX_HTML =
 "<!doctype html><html><head><meta charset=utf-8>\n"
 "<meta name=viewport content='width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no'>\n"
-"<title>Mac Display</title><style>\n"
+"<title>HoppScreen</title><style>\n"
 "html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}\n"
 "#c,#s{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;display:none}\n"
 "#ui{position:fixed;inset:0;display:flex;flex-direction:column;gap:22px;align-items:center;justify-content:center;background:#000;z-index:9;color:#bbb;font:17px system-ui,sans-serif;text-align:center;padding:24px}\n"
@@ -1221,8 +1227,16 @@ static const char *INDEX_HTML =
 "function startMjpeg(){mode='mjpeg';report();img.style.display='block';cv.style.display='none';\n"
 " img.onerror=()=>{if(alive)setTimeout(()=>{img.src='/stream.mjpg?t='+Date.now();},900);};\n"
 " img.onload=()=>tick();img.src='/stream.mjpg?t='+Date.now();}\n"
+"async function fit(){try{const s=await(await fetch('/status',{cache:'no-store'})).json();\n"
+" const W=Math.round(screen.width*devicePixelRatio),H=Math.round(screen.height*devicePixelRatio);\n"
+" if(!W||!H||W<500||H<500)return;if(Math.abs(W-s.pixel_width)<=W/8&&Math.abs(H-s.pixel_height)<=H/8)return;\n"
+" let hz=0;const d=[];let n=0;await new Promise(r=>requestAnimationFrame(function f(t){d.push(t);if(++n>=24)r();else requestAnimationFrame(f)}));\n"
+" if(d.length>5){const dt=d[d.length-1]-d[0];if(dt>0)hz=Math.round(1000*(d.length-1)/dt);}\n"
+" await fetch('/fit?w='+W+'&h='+H+'&dpr='+devicePixelRatio+'&hz='+(hz||60),{cache:'no-store'});\n"
+"}catch(e){}}\n"
 "async function start(){\n"
 " alive=true;st.style.display='block';\n"
+" fit();\n"
 " if(WC){mode='h264';\n"
 "  while(alive){try{await startH264();}catch(e){console.warn(e);report('&err='+encodeURIComponent(String(e&&e.message||e)));}\n"
 "   if(!alive)break;await new Promise(r=>setTimeout(r,500));}\n"
@@ -1293,6 +1307,49 @@ static void peerIp(int fd, char *out, size_t n) {
         inet_ntop(AF_INET, &peer.sin_addr, out, (socklen_t)n);
 }
 
+// ============================================================ auto-fit (/fit)
+// HoppScreen is generic: the receiver may be any device with a browser. The
+// page compares its own panel with /status and calls /fit?w=&h=&dpr=&hz=;
+// if the current framebuffer is far off, the server re-execs itself with
+// matching display arguments. execv keeps the pid (so make's pidfile stays
+// valid) and the log fd; WindowServer reaps the old virtual display, and
+// VirtualDisplay's serial-retry loop handles the teardown race.
+//   - no args at launch  -> auto-fit ON
+//   - explicit W H args  -> auto-fit OFF (user pinned the size)
+//   - PAD6_AUTOFIT=0/1   -> force either way
+static uint16_t g_port = 0;
+static int g_httpFd = -1, g_tlsFd = -1;
+static BOOL g_autofit = NO;
+static char g_exePath[PATH_MAX] = {0};
+static time_t g_lastFit = 0;                 // survives re-execs via PAD6_LASTFIT
+
+static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) __attribute__((noreturn));
+static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) {
+    fprintf(stderr, "[fit] re-exec as %ux%u pt %s @%.0f\n",
+            ptW, ptH, hiDPI ? "(HiDPI 2x)" : "(1x)", fps);
+    fflush(stdout); fflush(stderr);
+    // the new instance must use the scale decided here, whatever the env says
+    setenv("PAD6_SCALE", hiDPI ? "0" : "1", 1);          // "0" -> stays HiDPI
+    setenv("PAD6_AUTOFIT", "1", 1);                      // explicit args must NOT pin
+                                                          // the size after a refit
+    {   // keep the refit rate-limit window across the exec
+        char tS[24];
+        snprintf(tS, sizeof tS, "%lld", (long long)g_lastFit);
+        setenv("PAD6_LASTFIT", tS, 1);
+    }
+    char wS[16], hS[16], pS[16], fS[16];
+    snprintf(wS, sizeof wS, "%u", ptW);
+    snprintf(hS, sizeof hS, "%u", ptH);
+    snprintf(pS, sizeof pS, "%u", g_port);
+    snprintf(fS, sizeof fS, "%u", (uint32_t)(fps + 0.5));
+    char *av[] = { g_exePath, wS, hS, pS, fS, NULL };
+    if (g_httpFd >= 0) close(g_httpFd);                  // child re-binds them
+    if (g_tlsFd >= 0) close(g_tlsFd);
+    execv(g_exePath, av);
+    perror("[fit] execv");                               // only on failure
+    _exit(1);
+}
+
 // ============================================================ handlers
 static void handleClient(int fd, BOOL tls) {
     @autoreleasepool {
@@ -1325,7 +1382,7 @@ static void handleClient(int fd, BOOL tls) {
             char resp[640];
             snprintf(resp, sizeof(resp),
                 "HTTP/1.1 401 Unauthorized\r\n"
-                "WWW-Authenticate: Basic realm=\"pad6display\", charset=\"UTF-8\"\r\n"
+                "WWW-Authenticate: Basic realm=\"hoppscreen\", charset=\"UTF-8\"\r\n"
                 "Content-Type: text/html\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
                 strlen(body), body);
             writeStr(fd, resp);
@@ -1346,7 +1403,7 @@ static void handleClient(int fd, BOOL tls) {
                 char hdr[256];
                 snprintf(hdr, sizeof(hdr),
                     "HTTP/1.1 200 OK\r\nContent-Type: application/x-x509-ca-cert\r\n"
-                    "Content-Disposition: attachment; filename=\"pad6display-ca.crt\"\r\n"
+                    "Content-Disposition: attachment; filename=\"hoppscreen-ca.crt\"\r\n"
                     "Content-Length: %lu\r\nConnection: close\r\n\r\n", (unsigned long)g_caCert.length);
                 writeStr(fd, hdr); writeAll(fd, g_caCert.bytes, g_caCert.length);
             }
@@ -1513,6 +1570,39 @@ static void handleClient(int fd, BOOL tls) {
                 "Connection: close\r\n\r\n", strlen(body));
             writeStr(fd, hdr); writeStr(fd, body);
         }
+        else if (strcmp(path, "/fit") == 0) {
+            // auto-fit: the page reports its panel (pixels, dpr, measured Hz)
+            long w = 0, h = 0; double dpr = 2.0, hz = 0;
+            char *p;
+            if ((p = strstr(query, "w=")) != NULL) w = atol(p + 2);
+            if ((p = strstr(query, "h=")) != NULL) h = atol(p + 2);
+            if ((p = strstr(query, "dpr=")) != NULL) dpr = atof(p + 4);
+            if ((p = strstr(query, "hz=")) != NULL) hz = atof(p + 3);
+            if (w < 500 || w > 3840 || h < 500 || h > 2400 || w * h > 3840L * 2160L) {
+                writeStr(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            } else if (!g_autofit) {
+                writeStr(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+            } else if (labs(w - (long)g_pixW) <= w / 8 && labs(h - (long)g_pixH) <= h / 8) {
+                writeStr(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"); // close enough
+            } else {
+                time_t now = time(NULL);
+                if (now - g_lastFit < 30) {              // don't ping-pong between devices
+                    writeStr(fd, "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                } else {
+                    g_lastFit = now;
+                    BOOL hi = dpr >= 1.5;                // Retina panels render at 2x points
+                    uint32_t ptW = hi ? (uint32_t)((w + 1) / 2) : (uint32_t)w;
+                    uint32_t ptH = hi ? (uint32_t)((h + 1) / 2) : (uint32_t)h;
+                    double fps = 60.0;
+                    if (hz > 0) fps = hz < 30 ? 30 : (hz > 120 ? 120 : (double)((int)(hz / 10) * 10));
+                    writeStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n"
+                                 "Connection: close\r\n\r\nrefit\n");
+                    closeConn(fd);
+                    usleep(300000);                      // let the response flush
+                    refitExec(ptW, ptH, fps, hi);        // never returns
+                }
+            }
+        }
         else {
             writeStr(fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
         }
@@ -1550,15 +1640,29 @@ static void onSig(int sig) { (void)sig; g_running = NO; }
 
 int main(int argc, char **argv) {
     // args are the LOGICAL ("looks like") size in points; the framebuffer is 2x that
-    // (Retina) unless PAD6_SCALE=1. Default 1440x900 pt = 2880x1800 px = Pad 6 native.
+    // (Retina) unless PAD6_SCALE=1. Default 1440x900 pt = 2880x1800 px. With no
+    // size args, auto-fit can recreate the display to match the first client.
     uint32_t w = argc > 1 ? (uint32_t)atoi(argv[1]) : 1440;
     uint32_t h = argc > 2 ? (uint32_t)atoi(argv[2]) : 900;
     uint16_t port = argc > 3 ? (uint16_t)atoi(argv[3]) : 8080;
-    g_fps = argc > 4 ? atof(argv[4]) : 120.0;   // Pad 6 panel is 144Hz: 120 halves per-frame latency
+    g_fps = argc > 4 ? atof(argv[4]) : 120.0;   // high-hz panels: 120 halves per-frame latency
     BOOL hiDPI = !(getenv("PAD6_SCALE") && atoi(getenv("PAD6_SCALE")) == 1);
     if (!w || !h || !port || g_fps < 1 || g_fps > 120) {
         fprintf(stderr, "usage: %s [width_pt height_pt [port [fps]]]   (default 1440 900 8080 120)\n", argv[0]);
         return 2;
+    }
+
+    g_port = port;                                    // for /fit's re-exec
+    {                                                 // absolute path: cwd may differ
+        uint32_t n = (uint32_t)sizeof(g_exePath) - 1;
+        if (_NSGetExecutablePath(g_exePath, &n) != 0) g_exePath[0] = 0;
+    }
+    // auto-fit: on with no size args, off when the size was pinned; PAD6_AUTOFIT forces
+    {
+        const char *af = getenv("PAD6_AUTOFIT");
+        g_autofit = (argc > 1) ? (af && atoi(af) == 1) : !(af && atoi(af) == 0);
+        const char *lf = getenv("PAD6_LASTFIT");       // rate-limit window survives execs
+        if (lf) g_lastFit = (time_t)atoll(lf);
     }
 
     signal(SIGINT, onSig); signal(SIGTERM, onSig); signal(SIGHUP, onSig);
@@ -1640,8 +1744,8 @@ int main(int argc, char **argv) {
                user.UTF8String ?: "<any>", pass.UTF8String, src.UTF8String);
     }
 
-    int lfd = listenSocket(port);
-    if (lfd < 0) return 1;
+    g_httpFd = listenSocket(port);
+    if (g_httpFd < 0) return 1;
 
     // HTTPS: certs.sh (run by make) keeps certs/server.p12 valid for the current IPs
     int tfd = -1;
@@ -1652,23 +1756,26 @@ int main(int argc, char **argv) {
         g_caCert = [NSData dataWithContentsOfFile:[certDir stringByAppendingPathComponent:@"ca.crt"]];
         if (tlsPort && loadTLSIdentity([certDir stringByAppendingPathComponent:@"server.p12"])) {
             tfd = listenSocket(tlsPort);
-            if (tfd >= 0) g_tlsPort = tlsPort;
+            if (tfd >= 0) { g_tlsPort = tlsPort; g_tlsFd = tfd; }
         } else if (tlsPort) {
             fprintf(stderr, "[tls] no certs/server.p12 — HTTPS disabled (run ./certs.sh)\n");
         }
     }
 
     if (g_tlsPort) {
-        printf("serving — open on the Pad (secure = sharp H.264, direct over Wi-Fi):\n");
+        printf("serving — open on the receiver (secure = sharp H.264, direct over Wi-Fi):\n");
         printLocalURLs("https", g_tlsPort);
-        printf("  first time: install certs/ca.crt on the Pad (README: 'Why HTTPS'),\n"
+        printf("  first time: install certs/ca.crt on the receiver (README: 'Why HTTPS'),\n"
                "  or just tap Advanced -> Proceed through Chrome's warning\n");
         printf("  plain http (MJPEG fallback) on :%u\n", port);
     } else {
-        printf("serving — open on the Pad:\n");
+        printf("serving — open on the receiver:\n");
         printLocalURLs("http", port);
         printf("  (no certs/server.p12 — MJPEG only; run ./certs.sh for sharp H.264)\n");
     }
+    printf("  auto-fit: %s\n", g_autofit ?
+           "on — the display will match the first client's panel" :
+           "off — size pinned by launch args (PAD6_AUTOFIT=1 to enable)");
     fflush(stdout);
 
     if (getenv("PAD6_POLL")) {              // debug: skip push APIs entirely
@@ -1683,7 +1790,7 @@ int main(int argc, char **argv) {
         startPolling();
     }
     pthread_t srvT, jpgT, refT;
-    ListenArg *la = malloc(sizeof(ListenArg)); la->lfd = lfd; la->tls = NO;
+    ListenArg *la = malloc(sizeof(ListenArg)); la->lfd = g_httpFd; la->tls = NO;
     pthread_create(&srvT, NULL, serverThread, la);
     pthread_detach(srvT);
     if (tfd >= 0) {
@@ -1711,7 +1818,7 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "shutting down...\n");
-    close(lfd);
+    close(g_httpFd);
     if (tfd >= 0) close(tfd);
     if (g_scStream) {
         dispatch_semaphore_t done = dispatch_semaphore_create(0);

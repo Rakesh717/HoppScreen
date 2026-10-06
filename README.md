@@ -1,25 +1,29 @@
-# pad6display — Xiaomi Pad 6 as a wireless extended display for macOS
+# HoppScreen — any tablet or laptop as a wireless extended display for macOS
 
-Custom wireless-display stack. The Pad's native Miracast sink is unreachable from
-macOS (it lives on a Wi-Fi Direct link Apple never exposed — verified by scan:
-no mDNS, no LAN ports, no P2P group visible). So we build our own link:
-a **real virtual display** on the Mac, streamed as **hardware H.264** to the
-Pad's **browser** (WebCodecs) over LAN. No apps installed on the Pad.
+Custom wireless-display stack. The receiver is **any device with a modern
+browser** (Chrome/Edge; tested on an Android tablet) — nothing to install on
+it. The Mac gets a **real virtual display**, streamed as **hardware H.264** to
+the receiver's browser (WebCodecs) over the LAN, with password protection.
+
+(Grew out of a Xiaomi Pad 6 project: the Pad's native Miracast sink is
+unreachable from macOS — it lives on a Wi-Fi Direct link Apple never exposed;
+verified by scan: no mDNS, no LAN ports, no P2P group visible.)
 
 ```
-[CGVirtualDisplay  looks like 1440x900, HiDPI -> 2880x1800 px = Pad 6 native panel]
+[CGVirtualDisplay  looks like 1440x900 pt, HiDPI -> 2880x1800 px framebuffer]
    -> capture: ScreenCaptureKit push (cursor composited by WindowServer), 60fps
       fallback chain: CGDisplayStream -> CGDisplayCreateImage polling (+ manual cursor)
    -> VideoToolbox H.264 (hardware, High@5.2, ~28Mbps cap, no B-frames, IDR on demand)
    -> HTTP :8080
-        /            player page (WebCodecs, MJPEG fallback, fullscreen+wakelock)
+        /            player page (WebCodecs H.264, MJPEG fallback, fullscreen+wakelock)
         /h264        [4B len][JSON cfg] then [4B len][1B flags][8B capture µs][AVCC AU]...
         /time        server clock (latency measurement)
         /stream.mjpg MJPEG multipart (fallback)
         /frame.jpg   single JPEG (debug)
         /status      JSON stats
-        /ca.crt      local CA (install on the Pad once)
-   -> HTTPS :8443 (same endpoints, TLS) -> Pad 6 Chrome (secure context)
+        /fit         auto-fit: client panel report -> server re-execs at that size
+        /ca.crt      local CA (install on the receiver once)
+   -> HTTPS :8443 (same endpoints, TLS) -> receiver browser (secure context)
       -> WebCodecs VideoDecoder (hardware) -> <canvas>, optimizeForLatency
 ```
 
@@ -34,16 +38,30 @@ make log                     # follow the server log
 make run                     # foreground instead (ctrl-c stops)
 ```
 
-Then open the printed `https://<mac-ip>:8443` URL on the Pad's Chrome (type it once —
-Chrome remembers it).
+Then open the printed `https://<mac-ip>:8443` URL in the receiver's browser
+(type it once — Chrome remembers it).
 
-Default mode looks like 1440x900 (Retina, 2880x1800 px = Pad 6 native panel) @120fps.
-The encoder sleeps while no client is connected.
+Default mode looks like 1440x900 pt (Retina, 2880x1800 px) @120fps. The encoder
+sleeps while no client is connected.
 
-Other sizes: `make start ARGS="1680 1050"` gives more space but smaller, slightly
-softer text. `PAD6_SCALE=1 make start ARGS="2880 1800"` uses a non-Retina 1x mode
-with tiny text. `make start ARGS="1440 900 8080 60"` for 60fps (less Mac/Pad load,
-~15ms more lag).
+### Auto-fit
+
+With no size args, the first client that opens the page **resizes the virtual
+display to match that device's panel** — pixel-perfect for whatever opens it
+(a tablet, a phone, a laptop). The page measures its screen and refresh rate,
+calls `/fit`, and the server restarts itself with matching dimensions (same
+pid, ~2s blip, page reconnects automatically). Rate-limited to one refit per
+30s. `PAD6_AUTOFIT=0` disables; launching with an explicit size pins it:
+
+```bash
+make start                          # auto-fit on
+make start ARGS="1680 1050"         # pinned size, auto-fit off
+PAD6_AUTOFIT=1 make start ARGS="1680 1050"   # pinned + still auto-fit
+```
+
+Pinned sizes: `ARGS="1680 1050"` gives more space but smaller, slightly softer
+text. `PAD6_SCALE=1 ARGS="2880 1800"` uses a non-Retina 1x mode with tiny text.
+`ARGS="1440 900 8080 60"` for 60fps (less load, ~15ms more lag).
 
 ### Why HTTPS (port 8443)
 
@@ -57,7 +75,7 @@ about 24fps and laggy. The server also serves **HTTPS on port+363 (8443)**:
 - The CA is **name-constrained** to private IPs, `localhost` and `*.local`. Even if
   `certs/ca.key` leaked, it couldn't be used to impersonate real websites. Keep `certs/`
   private anyway.
-- Install `ca.crt` on the Pad once (on the Pad, open `http://<mac-ip>:8080/ca.crt`,
+- Install `ca.crt` on the receiver once (in its browser, open `http://<mac-ip>:8080/ca.crt`,
   then Settings → Encryption & credentials → Install a certificate → CA certificate).
   After that the https page has no warnings. Without installing it, Chrome warns
   and **Advanced → Proceed** still works.

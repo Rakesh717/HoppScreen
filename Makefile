@@ -1,24 +1,26 @@
-# pad6display — build & service control (the single entry point)
+# HoppScreen — build & service control (the single entry point)
 #   make run      build if needed, then run in the FOREGROUND (ctrl-c stops)
 #   make start    build if needed, then run in the background (log: server.log)
 #   make stop | restart | status | log | build | help
 # The background server writes to server.log and its pid to server.pid.
 # Run make from this directory.
 
-BIN     := pad6display
+BIN     := hoppscreen
 PIDFILE := server.pid
 LOG     := server.log
-# readiness-probe port — set this too if ARGS changes the server port
+# readiness-probe port — set this too if ARGS changes the port
 PORT    ?= 8080
-# server args [width_pt height_pt port fps], e.g. make start ARGS="1680 1050"
+# server args [width_pt height_pt port fps] passed straight to the binary.
+# EMPTY by default: the server then auto-fits its display to the first client
+# that opens the page. Setting ARGS (e.g. ARGS="1680 1050") pins the size and
+# disables auto-fit.
 ARGS    ?=
-SERVER_ARGS = $(if $(ARGS),$(ARGS),1440 900 8080 120)
 
 .DEFAULT_GOAL := help
 .PHONY: help run start stop restart status log build
 
 help:
-	@echo "pad6display — make <target>"
+	@echo "HoppScreen — make <target>"
 	@echo "  run        build if needed, run in the foreground (ctrl-c stops)"
 	@echo "  start      build if needed, run in the background (log: $(LOG))"
 	@echo "  stop       graceful stop (also removes the virtual display)"
@@ -26,7 +28,7 @@ help:
 	@echo "  status     running? pid, uptime, /status json, recent log"
 	@echo "  log        follow the server log (ctrl-c to leave)"
 	@echo "  build      compile only (run/start do this automatically)"
-	@echo "  vars:      ARGS=\"1680 1050\"  (PORT=8080 for the probe)"
+	@echo "  vars:      ARGS=\"1680 1050\" pins the display size (PORT=8080 for the probe)"
 
 # staleness (missing binary / newer sources) is make's own dependency check
 $(BIN): server.m virtualdisplay.m virtualdisplay.h
@@ -38,16 +40,16 @@ $(BIN): server.m virtualdisplay.m virtualdisplay.h
 
 build: $(BIN)
 
-# foreground mode: replaces the old ./run.sh (certs -> exec the server)
+# foreground mode (certs -> exec the server)
 run: build
 	@./certs.sh || echo "warning: certificate setup failed — HTTPS disabled"
-	@exec ./pad6display $(SERVER_ARGS)
+	@exec ./$(BIN) $(ARGS)
 
 start: build
 	@if [ -f $(PIDFILE) ] && kill -0 $$(cat $(PIDFILE)) 2>/dev/null; then \
 	    echo "already running (pid $$(cat $(PIDFILE))) — try: make restart"; exit 0; fi
 	@./certs.sh || echo "warning: certificate setup failed — HTTPS disabled"
-	@nohup ./pad6display $(SERVER_ARGS) >$(LOG) 2>&1 & echo $$! >$(PIDFILE)
+	@nohup ./$(BIN) $(ARGS) >$(LOG) 2>&1 & echo $$! >$(PIDFILE)
 	@for i in $$(seq 1 40); do \
 	    if curl -s -m 1 "http://127.0.0.1:$(PORT)/status" >/dev/null 2>&1; then \
 	        echo "running (pid $$(cat $(PIDFILE))) — log: $(LOG)"; \
