@@ -49,6 +49,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <AppKit/AppKit.h>
+#import <IOKit/pwr_mgt/IOPMLib.h> // user-activity assertion: re-activate the virtual display
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -2094,6 +2095,25 @@ static double clampd(double v, double lo, double hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// macOS 26 can drop the headless virtual display out of the ACTIVE list while
+// it stays online: capture/encode keep working, but WindowServer refuses to
+// move the pointer onto it, so every touch clamps to the real screen's edge.
+// Holding a user-activity assertion (what `caffeinate -u` does) re-activates
+// it. Called before applying gestures; self-heals within ~a second.
+static void ensureDisplayActive(void) {
+    if (!g_displayID || CGDisplayIsActive(g_displayID))
+        return;
+    IOPMAssertionID aid = 0;
+    // "UserIsActive" is the assertion type behind `caffeinate -u` (no public constant)
+    if (IOPMAssertionCreateWithName(CFSTR("UserIsActive"), kIOPMAssertionLevelOn,
+                                    CFSTR("HoppScreen virtual display wake"), &aid) ==
+        kIOReturnSuccess) {
+        fprintf(stderr, "[input] virtual display #%u inactive — waking it\n", g_displayID);
+        usleep(1200000); // WindowServer needs a beat to re-activate the display
+        IOPMAssertionRelease(aid);
+    }
+}
+
 static CGPoint inputPoint(double nx, double ny) { // stream coords -> global desktop points
     CGRect b = CGDisplayBounds(g_displayID);      // origin is global; the SIZE can lag
     return CGPointMake(b.origin.x + clampd(nx, 0, 1) * (g_dispW - 1), // g_dispW/H = served mode
@@ -2723,6 +2743,7 @@ static void handleClient(int fd, BOOL tls) {
                             g_inputLogged = YES;
                         }
                         if (g_inputTrusted)
+                            ensureDisplayActive(); // pointer needs an active display to land on
                             dispatch_async(g_inputQ, ^{
                               applyInputEvent(ev);
                             }); // serial: keeps order

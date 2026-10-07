@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_srtp.dir/test/test_srtp.c.o -o test_srtp  libsrtp2.a /opt/homebrew/opt/openssl@3/lib/libcrypto.dylib

@@ -1,0 +1,12 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/blackbox/Codes/pad6-display/.rtc-build/lib/cmake_install.cmake",
+		"/Users/blackbox/Codes/pad6-display/.rtc-build/lib/deps/plog/cmake_install.cmake",
+		"/Users/blackbox/Codes/pad6-display/.rtc-build/lib/deps/usrsctp/cmake_install.cmake",
+		"/Users/blackbox/Codes/pad6-display/.rtc-build/lib/deps/usrsctp/usrsctplib/cmake_install.cmake",
+		"/Users/blackbox/Codes/pad6-display/.rtc-build/lib/deps/libsrtp/cmake_install.cmake",
+		"/Users/blackbox/Codes/pad6-display/.rtc-build/lib/deps/libjuice/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
