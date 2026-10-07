@@ -69,6 +69,7 @@ $(BIN): server.m virtualdisplay.m virtualdisplay.h web_index.h
 	    -framework Foundation -framework CoreGraphics -framework AppKit \
 	    -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
 	    -framework ScreenCaptureKit -framework IOSurface -framework Security \
+	    -framework IOKit \
 	    server.m virtualdisplay.m -o $(BIN)
 
 build: $(BIN)
