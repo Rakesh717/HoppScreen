@@ -701,11 +701,12 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status, VTEncodeInf
     }
     pthread_cond_broadcast(&g_auCond);
 #ifdef HOPP_RTC
-    NSData *rtcConfig = [[NSData alloc] initWithBase64EncodedString:g_avcCB64 ?: @"" options:0];
+    NSData *rtcConfig =
+        isKey ? [[NSData alloc] initWithBase64EncodedString:g_avcCB64 ?: @"" options:0] : nil;
 #endif
     pthread_mutex_unlock(&g_lock);
 #ifdef HOPP_RTC
-    hopp_rtc_frame(data.bytes, data.length, rtcConfig.bytes, rtcConfig.length, ptsUs, isKey);
+    hopp_rtc_frame(data.bytes, data.length, rtcConfig.bytes, rtcConfig.length, upUs, isKey);
 #endif
 }
 
@@ -1155,6 +1156,9 @@ static volatile int g_scFailed = 0; // set by the delegate when SCK stops the st
 @end
 
 static BOOL encoderWanted(void) {
+#ifdef HOPP_RTC
+    return hopp_rtc_wanted() || g_avcCB64 == nil;
+#endif
     // nobody watching -> don't burn the hardware encoder (heat/battery). Still encode
     // until the first avcC exists so clients can start instantly.
     return g_h264Clients > 0 || g_avcCB64 == nil;
@@ -2260,20 +2264,33 @@ static void rtcOfferHTTP(int fd, const char *req, ssize_t n) {
                 break;
             used += (size_t)r;
         }
-        id json = used == (size_t)count ? [NSJSONSerialization JSONObjectWithData:body options:0 error:nil] : nil;
-        if ([json isKindOfClass:[NSDictionary class]] && [json[@"sdp"] isKindOfClass:[NSString class]] &&
-            [json[@"type"] isEqual:@"offer"]) {
-            char *answer = hopp_rtc_offer([json[@"sdp"] UTF8String], rtcRequestKeyframe, &ok);
+        id json = used == (size_t)count
+                      ? [NSJSONSerialization JSONObjectWithData:body options:0 error:nil]
+                      : nil;
+        if ([json isKindOfClass:[NSDictionary class]] &&
+            [json[@"sdp"] isKindOfClass:[NSString class]] && [json[@"type"] isEqual:@"offer"]) {
+            pthread_mutex_lock(&g_lock);
+            NSString *codec = g_codec;
+            pthread_mutex_unlock(&g_lock);
+            NSString *profile = [codec hasPrefix:@"avc1.64"] && codec.length == 11
+                                    ? [@"6400" stringByAppendingString:[codec substringFromIndex:9]]
+                                    : nil;
+            char *answer = hopp_rtc_offer([json[@"sdp"] UTF8String], profile.UTF8String,
+                                          rtcRequestKeyframe, &ok);
             NSString *text = answer ? [NSString stringWithUTF8String:answer] : @"allocation failed";
-            result = ok ? @{@"type": @"answer", @"sdp": text} : @{@"error": text};
+            result = ok ? @{@"type" : @"answer", @"sdp" : text} : @{@"error" : text};
             free(answer);
         }
     }
-    NSData *body = [NSJSONSerialization dataWithJSONObject:result ?: @{@"error": @"bounded JSON offer required"}
-                                                 options:0 error:nil];
+    NSData *body = [NSJSONSerialization
+        dataWithJSONObject:result ?: @{@"error" : @"bounded JSON offer required"}
+                   options:0
+                     error:nil];
     char hdr[256];
-    snprintf(hdr, sizeof hdr, "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
-             "Cache-Control: no-store\r\nConnection: close\r\n\r\n", ok ? "200 OK" : "400 Bad Request", (size_t)body.length);
+    snprintf(hdr, sizeof hdr,
+             "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
+             "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+             ok ? "200 OK" : "400 Bad Request", (size_t)body.length);
     writeStr(fd, hdr);
     writeAll(fd, body.bytes, body.length);
 }
@@ -2349,18 +2366,23 @@ static void handleClient(int fd, BOOL tls) {
             closeConn(fd);
             return;
         }
-        if ((strcmp(path, "/") == 0 || strcmp(path, "/rtc-test.html") == 0) && strcmp(method, "GET") == 0) {
+        if ((strcmp(path, "/") == 0 || strcmp(path, "/rtc-test.html") == 0) &&
+            strcmp(method, "GET") == 0) {
             char hdr[256];
-            snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %u\r\n"
-                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n", web_rtc_test_html_len);
+            snprintf(hdr, sizeof hdr,
+                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %u\r\n"
+                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                     web_rtc_test_html_len);
             writeStr(fd, hdr);
             writeAll(fd, (const char *)web_rtc_test_html, web_rtc_test_html_len);
             closeConn(fd);
             return;
         }
         // The spike is video-only; do not expose legacy input/audio/refit mutation routes.
-        if (strcmp(path, "/ca.crt") != 0 && strcmp(path, "/status") != 0 && strcmp(path, "/time") != 0) {
-            writeStr(fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        if (strcmp(path, "/ca.crt") != 0 && strcmp(path, "/status") != 0 &&
+            strcmp(path, "/time") != 0) {
+            writeStr(fd,
+                     "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             closeConn(fd);
             return;
         }

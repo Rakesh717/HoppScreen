@@ -2,6 +2,7 @@
 #include "rtc_packetizer.h"
 #include <rtc/rtc.hpp>
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +23,8 @@ struct Session {
 };
 std::mutex mutex;
 std::shared_ptr<Session> active;
+std::atomic<bool> wanted{false};
+std::atomic<uint32_t> liveId{0};
 
 std::vector<hopp::Bytes> parameterSets(const uint8_t *p, size_t n) {
     if (n < 7 || p[0] != 1 || (p[4] & 3) != 3)
@@ -50,7 +53,8 @@ std::vector<hopp::Bytes> parameterSets(const uint8_t *p, size_t n) {
 }
 } // namespace
 
-extern "C" char *hopp_rtc_offer(const char *sdp, void (*keyframe)(void), bool *ok) {
+extern "C" char *hopp_rtc_offer(const char *sdp, const char *encoderProfile, void (*keyframe)(void),
+                                bool *ok) {
     std::lock_guard lock(mutex);
     *ok = false;
     try {
@@ -63,7 +67,8 @@ extern "C" char *hopp_rtc_offer(const char *sdp, void (*keyframe)(void), bool *o
             (*video)->direction() != rtc::Description::Direction::RecvOnly)
             throw std::runtime_error("recvonly video required");
         int pt = -1;
-        std::string profile;
+        if (!encoderProfile || strlen(encoderProfile) != 6)
+            throw std::runtime_error("encoder configuration not ready; retry");
         for (int candidate : (*video)->payloadTypes()) {
             auto map = (*video)->rtpMap(candidate);
             std::string params;
@@ -71,20 +76,27 @@ extern "C" char *hopp_rtc_offer(const char *sdp, void (*keyframe)(void), bool *o
                 params += p;
             // Existing encoder is High/ConstrainedHigh. Do not pretend it is Baseline.
             if (map->format == "H264" && params.find("packetization-mode=1") != std::string::npos &&
-                params.find("profile-level-id=64") != std::string::npos) {
+                params.find("profile-level-id=64") != std::string::npos &&
+                params.find("level-asymmetry-allowed=1") != std::string::npos) {
                 pt = candidate;
-                profile = params;
                 break;
             }
         }
         if (pt < 0)
             throw std::runtime_error("offer must include H264 High, packetization-mode=1");
         auto session = std::make_shared<Session>();
+        uint32_t id = arc4random();
         rtc::Configuration cfg;
         cfg.disableAutoNegotiation = true;
         session->pc = std::make_shared<rtc::PeerConnection>(cfg);
-        session->pc->onStateChange([](rtc::PeerConnection::State state) {
+        session->pc->onStateChange([id](rtc::PeerConnection::State state) {
             fprintf(stderr, "[rtc] state=%d\n", int(state));
+            if (liveId == id && state == rtc::PeerConnection::State::Connected)
+                wanted = true;
+            if (liveId == id && (state == rtc::PeerConnection::State::Failed ||
+                                 state == rtc::PeerConnection::State::Closed ||
+                                 state == rtc::PeerConnection::State::Disconnected))
+                wanted = false;
         });
         std::weak_ptr<Session> weak = session;
         session->pc->onGatheringStateChange([weak](rtc::PeerConnection::GatheringState state) {
@@ -96,16 +108,21 @@ extern "C" char *hopp_rtc_offer(const char *sdp, void (*keyframe)(void), bool *o
                 }
         });
         rtc::Description::Video desc((*video)->mid(), rtc::Description::Direction::SendOnly);
-        desc.addH264Codec(pt, profile);
+        // Advertise High (a superset of VT's ConstrainedHigh), at the actual SPS level.
+        desc.addH264Codec(
+            pt, std::string("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=") +
+                    encoderProfile);
         uint32_t ssrc = arc4random();
         desc.addSSRC(ssrc, "hoppscreen", "hoppscreen", "screen");
         session->track = session->pc->addTrack(desc);
-        session->config = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, "hoppscreen", pt, 90000);
+        session->config =
+            std::make_shared<rtc::RtpPacketizationConfig>(ssrc, "hoppscreen", pt, 90000);
         auto sr = std::make_shared<rtc::RtcpSrReporter>(session->config);
         sr->addToChain(std::make_shared<rtc::RtcpNackResponder>(512));
         sr->addToChain(std::make_shared<rtc::PliHandler>(keyframe));
         sr->addToChain(std::make_shared<rtc::RembHandler>([](unsigned bps) {
-            fprintf(stderr, "[rtc] REMB=%u bps (observed only; encoder remains manually capped)\n", bps);
+            fprintf(stderr, "[rtc] REMB=%u bps (observed only; encoder remains manually capped)\n",
+                    bps);
         }));
         session->track->setMediaHandler(sr);
         session->track->onOpen([keyframe] { keyframe(); });
@@ -119,7 +136,10 @@ extern "C" char *hopp_rtc_offer(const char *sdp, void (*keyframe)(void), bool *o
         if (active)
             active->pc->close();
         active = session;
-        fprintf(stderr, "[rtc] answer ready PT=%d SSRC=%u; single receiver replaces previous\n", pt, ssrc);
+        liveId = id;
+        wanted = true;
+        fprintf(stderr, "[rtc] answer ready PT=%d SSRC=%u; single receiver replaces previous\n", pt,
+                ssrc);
         *ok = true;
         return strdup(answer.c_str());
     } catch (const std::exception &e) {
@@ -128,8 +148,12 @@ extern "C" char *hopp_rtc_offer(const char *sdp, void (*keyframe)(void), bool *o
     }
 }
 
+extern "C" bool hopp_rtc_wanted(void) {
+    return wanted.load();
+}
+
 extern "C" void hopp_rtc_frame(const uint8_t *data, size_t size, const uint8_t *config,
-                                size_t configSize, int64_t pts, bool key) {
+                               size_t configSize, int64_t pts, bool key) {
     // Never wait behind signaling or build an unbounded capture queue.
     std::unique_lock lock(mutex, std::try_to_lock);
     if (!lock || !active || !active->track->isOpen() || (!active->started && !key))

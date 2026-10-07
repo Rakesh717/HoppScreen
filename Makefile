@@ -31,16 +31,16 @@ export HOPPSCREEN_INPUT = $(INPUT)
 
 .DEFAULT_GOAL := help
 .PHONY: help run start stop restart status log build format format-check clean
-.PHONY: rtc rtc-deps
+.PHONY: rtc rtc-deps rtc-test
 
 # Prototype only: no dependency or link changes to the shipped target.
 RTC_BUILD := .rtc-build
-OPENSSL_ROOT := $(shell brew --prefix openssl@3 2>/dev/null)
+OPENSSL_ROOT = $(shell brew --prefix openssl@3 2>/dev/null)
 rtc-deps:
 	@command -v cmake >/dev/null || { echo 'Install prerequisites: brew install cmake openssl@3'; exit 1; }
 	@test -n "$(OPENSSL_ROOT)" || { echo 'Install prerequisites: brew install openssl@3'; exit 1; }
 	git submodule update --init --recursive vendor/libdatachannel
-	cmake -S vendor/libdatachannel -B $(RTC_BUILD)/lib -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR=$(OPENSSL_ROOT) -DNO_EXAMPLES=ON -DNO_TESTS=ON -DNO_WEBSOCKET=ON -DNO_LIBNICE=ON -DBUILD_SHARED_LIBS=OFF
+	cmake -S vendor/libdatachannel -B $(RTC_BUILD)/lib -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR=$(OPENSSL_ROOT) -DNO_EXAMPLES=ON -DNO_TESTS=ON -DNO_WEBSOCKET=ON -DUSE_NICE=OFF -DBUILD_SHARED_LIBS=OFF
 	cmake --build $(RTC_BUILD)/lib -j 8
 
 $(RTC_BUILD)/lib/libdatachannel.a:
@@ -76,10 +76,14 @@ PRETTIER ?= npx --yes prettier
 format:
 	$(CLANG_FORMAT) -i server.m virtualdisplay.m virtualdisplay.h keeper.m bench2.m
 	$(PRETTIER) --write --print-width 100 web/index.html
+	$(CLANG_FORMAT) -i rtc_transport.cpp rtc_transport.h rtc_packetizer.h rtc_packetizer_test.cpp
+	$(PRETTIER) --write --print-width 100 web/rtc-test.html tests/rtc-offer.json
 
 format-check:
 	@$(CLANG_FORMAT) --dry-run --Werror server.m virtualdisplay.m virtualdisplay.h keeper.m bench2.m
 	@$(PRETTIER) --check --print-width 100 web/index.html
+	@$(CLANG_FORMAT) --dry-run --Werror rtc_transport.cpp rtc_transport.h rtc_packetizer.h rtc_packetizer_test.cpp
+	@$(PRETTIER) --check --print-width 100 web/rtc-test.html tests/rtc-offer.json
 
 help:
 	@echo "HoppScreen — make <target>"
@@ -90,6 +94,7 @@ help:
 	@echo "  status     running? pid, uptime, /status json, recent log"
 	@echo "  log        follow the server log (ctrl-c to leave)"
 	@echo "  build      compile only (run/start do this automatically)"
+	@echo "  rtc        isolated WebRTC spike binary (8090/8450); see docs/webrtc-spike.md"
 	@echo "  format     reformat C sources (clang-format) + web/index.html (prettier)"
 	@echo "  format-check  fail instead of fix — for CI / pre-commit"
 	@echo "  clean      remove the server binary and generated web header"

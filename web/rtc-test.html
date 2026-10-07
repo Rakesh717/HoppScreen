@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HoppScreen WebRTC spike</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      color: #fff;
+      font: 14px monospace;
+    }
+    video {
+      width: 100vw;
+      height: 100vh;
+      object-fit: contain;
+    }
+    #overlay {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      background: #000b;
+      padding: 12px;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+  <video id="video" autoplay muted playsinline></video>
+  <div id="overlay">
+    <button id="start">Connect</button>
+    <button id="fullscreen">Fullscreen</button>
+    <pre id="stats">Video-only prototype. One receiver. H.264 High required.</pre>
+  </div>
+  <script>
+    const video = document.querySelector("video");
+    const stats = document.querySelector("#stats");
+    let pc, timer;
+    document.querySelector("#fullscreen").onclick = () => {
+      if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen();
+      else video.webkitEnterFullscreen?.();
+    };
+    document.querySelector("#start").onclick = async () => {
+      clearInterval(timer);
+      pc?.close();
+      video.srcObject = null;
+      document.querySelector("#start").disabled = true;
+      stats.textContent = "Connecting…";
+      pc = new RTCPeerConnection({ iceServers: [] });
+      window.rtcPeer = pc;
+      const begun = performance.now();
+      let firstFrame = null,
+        previous = null;
+      video.requestVideoFrameCallback(() => {
+        firstFrame = performance.now() - begun;
+      });
+      pc.ontrack = ({ track }) => {
+        video.srcObject = new MediaStream([track]);
+      };
+      try {
+        const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
+        const codecs = RTCRtpReceiver.getCapabilities("video").codecs.filter(
+          (c) =>
+            c.mimeType.toLowerCase() === "video/h264" &&
+            /profile-level-id=64/i.test(c.sdpFmtpLine) &&
+            /packetization-mode=1/.test(c.sdpFmtpLine),
+        );
+        if (!codecs.length) throw new Error("Browser does not offer H.264 High (64xxxx).");
+        transceiver.setCodecPreferences(codecs);
+        await pc.setLocalDescription(await pc.createOffer());
+        if (pc.iceGatheringState !== "complete") {
+          await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error("ICE gathering timeout")), 10000);
+            pc.onicegatheringstatechange = () => {
+              if (pc.iceGatheringState === "complete") {
+                clearTimeout(timeout);
+                resolve();
+              }
+            };
+          });
+        }
+        const response = await fetch("/rtc/offer", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(pc.localDescription),
+        });
+        const answer = await response.json();
+        if (!response.ok) throw new Error(answer.error);
+        await pc.setRemoteDescription(answer);
+        timer = setInterval(async () => {
+          const report = await pc.getStats();
+          for (const s of report.values()) {
+            if (s.type !== "inbound-rtp" || s.kind !== "video") continue;
+            const seconds = previous ? (s.timestamp - previous.timestamp) / 1000 : 0;
+            const bytes = seconds ? (s.bytesReceived - previous.bytesReceived) / seconds : 0;
+            const fps = seconds
+              ? ((s.framesDecoded || 0) - (previous.framesDecoded || 0)) / seconds
+              : 0;
+            stats.textContent = `${pc.connectionState}\nTTFF: ${firstFrame?.toFixed(0) ?? "waiting"} ms\nfps: ${fps.toFixed(1)}\njitter: ${(s.jitter * 1000).toFixed(2)} ms\nbytes/s: ${bytes.toFixed(0)}\ncurrent received bitrate: ${((bytes * 8) / 1e6).toFixed(3)} Mbps\nframes: ${s.framesDecoded}\nloss: ${s.packetsLost}\nNo sender GCC/TWCC adaptation in this spike.`;
+            previous = s;
+          }
+        }, 1000);
+      } catch (e) {
+        stats.textContent = e.message;
+        pc.close();
+      } finally {
+        document.querySelector("#start").disabled = false;
+      }
+    };
+  </script>
+</html>

@@ -1,6 +1,5 @@
 # HoppScreen C/ObjC style — matches the hand-written conventions of server.m
 BasedOnStyle: LLVM
-Language: ObjC
 IndentWidth: 4
 TabWidth: 4
 UseTab: Never

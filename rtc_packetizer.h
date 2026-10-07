@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -48,8 +49,7 @@ inline std::vector<Bytes> payloads(const std::vector<Bytes> &nals, size_t mtu = 
         }
         size_t end = i, total = 1;
         uint8_t nri = 0;
-        while (end < nals.size() && !nals[end].empty() &&
-               total + 2 + nals[end].size() <= mtu) {
+        while (end < nals.size() && !nals[end].empty() && total + 2 + nals[end].size() <= mtu) {
             total += 2 + nals[end].size();
             nri = std::max(nri, uint8_t(nals[end][0] & 0x60));
             ++end;
@@ -73,9 +73,18 @@ inline std::vector<Bytes> payloads(const std::vector<Bytes> &nals, size_t mtu = 
 
 inline Bytes rtp(const Bytes &payload, uint8_t pt, uint16_t seq, uint32_t ts, uint32_t ssrc,
                  bool marker) {
-    Bytes out{0x80, uint8_t(pt | (marker ? 0x80 : 0)), uint8_t(seq >> 8), uint8_t(seq),
-              uint8_t(ts >> 24), uint8_t(ts >> 16), uint8_t(ts >> 8), uint8_t(ts),
-              uint8_t(ssrc >> 24), uint8_t(ssrc >> 16), uint8_t(ssrc >> 8), uint8_t(ssrc)};
+    Bytes out{0x80,
+              uint8_t(pt | (marker ? 0x80 : 0)),
+              uint8_t(seq >> 8),
+              uint8_t(seq),
+              uint8_t(ts >> 24),
+              uint8_t(ts >> 16),
+              uint8_t(ts >> 8),
+              uint8_t(ts),
+              uint8_t(ssrc >> 24),
+              uint8_t(ssrc >> 16),
+              uint8_t(ssrc >> 8),
+              uint8_t(ssrc)};
     out.insert(out.end(), payload.begin(), payload.end());
     return out;
 }
