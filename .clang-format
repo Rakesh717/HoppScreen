@@ -1,0 +1,19 @@
+# HoppScreen C/ObjC style — matches the hand-written conventions of server.m
+BasedOnStyle: LLVM
+Language: ObjC
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+PointerAlignment: Right
+BreakBeforeBraces: Attach
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortCaseLabelsOnASingleLine: false
+IndentCaseLabels: false
+SortIncludes: false            # include order is load-bearing in places; never shuffle
+AlignTrailingComments: true
+SpacesBeforeTrailingComments: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1

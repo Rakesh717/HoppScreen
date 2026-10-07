@@ -1,420 +1,1119 @@
-<!doctype html><html><head><meta charset=utf-8>
-<meta name=viewport content='width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no'>
-<title>HoppScreen</title><style>
-html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
-#c,#s{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;touch-action:none;display:none}
-#ui{position:fixed;inset:0;display:flex;flex-direction:column;gap:22px;align-items:center;justify-content:center;background:#000;z-index:9;color:#bbb;font:17px system-ui,sans-serif;text-align:center;padding:24px}
-#warn{color:#fb4;max-width:820px;line-height:1.5;display:none}
-#warn code{background:#222;padding:2px 6px;border-radius:4px;color:#fff}
-#st{color:#7f7;font:13px monospace;white-space:pre;pointer-events:none;text-align:left;line-height:1.5}
-#dr{position:fixed;top:0;right:0;bottom:0;width:290px;max-width:72vw;background:rgba(10,10,14,.93);color:#ddd;z-index:12;transform:translateX(105%);transition:transform .25s;padding:16px;box-sizing:border-box;font:14px system-ui;overflow-y:auto}
-#dr.on{transform:none}
-#tab{position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:11;background:rgba(10,10,14,.72);color:#ccc;border-radius:12px 0 0 12px;padding:22px 7px;font:17px system-ui;user-select:none;opacity:.55;transition:opacity .9s}
-#tab.dim{opacity:.12}
-button{font-size:22px;padding:18px 34px;border-radius:14px;border:0;background:#1a73e8;color:#fff;font-weight:600}
-</style></head><body>
-<canvas id=c></canvas><img id=s alt=''><video id=w playsinline loop muted preload=none style='position:fixed;left:0;top:0;width:1px;height:1px;opacity:0.01'></video><div id=st></div>
-<div id=ui><button id=go>&#9654; TAP FOR FULLSCREEN</button><div id=warn></div><div style='color:#666;font-size:14px'>tap the screen later to show/hide fps &middot; tap again after leaving fullscreen</div></div>
-<script>
-const $=i=>document.getElementById(i);
-const cv=$('c'),img=$('s'),st=$('st'),ui=$('ui');
-const WC=('VideoDecoder' in window);
- let alive=false,mode='',fpsN=0,fpsT=0,fps=0,info='';
-if(!WC){const w=$('warn');w.style.display='block';
- w.innerHTML='&#9888; Sharp low-latency H.264 needs a secure page. Falling back to MJPEG (blurry + laggy).';
- fetch('/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{if(!j.tls_port)return;
-  const u='https://'+location.hostname+':'+j.tls_port+'/';
-  if(!sessionStorage.triedTls){sessionStorage.triedTls=1;location.replace(u);return;}
-  w.innerHTML+='<br><br>Open the secure page: <a style="color:#8cf" href="'+u+'">'+u+'</a> (tap Advanced &rarr; Proceed to ignore the warning)<br>'+
-   'or install the CA once: download <a style="color:#8cf" href="/ca.crt">ca.crt</a> and add it under Settings &rarr; Security &rarr; Encryption &amp; credentials &rarr; Install a certificate &rarr; CA certificate.';
- }).catch(()=>{});}
-function report(x){fetch('/hello?mode='+mode+'&secure='+(window.isSecureContext?1:0)+'&screen='+
- Math.round(screen.width*devicePixelRatio)+'x'+Math.round(screen.height*devicePixelRatio)+'&dpr='+devicePixelRatio+(x||''),{cache:'no-store'}).catch(()=>{});}
-// latency instrumentation: frames carry their Mac capture time; clock offset via /time
-let off=0,latA=[],latS=[],lastRep=0,lastSend=0,finalLat=0;const rep=new Set();
-const srvNow=()=>performance.timeOrigin+performance.now()+off;
-async function clockSync(){let best=1e9;for(let i=0;i<6;i++){const t0=performance.now();
- const v=+(await (await fetch('/time',{cache:'no-store'})).text());const t1=performance.now();
- if(t1-t0<best){best=t1-t0;off=v/1000-(performance.timeOrigin+(t0+t1)/2);}}}
-const med=a=>{if(!a.length)return 0;const b=[...a].sort((x,y)=>x-y);return Math.round(b[b.length>>1]);};
-function latTick(q){const t=performance.now();if(t-lastRep<1000)return;
- const A=med(latA),S=med(latS);latA=[];latS=[];
- info=cvInfo+'\nlatency: arrive '+A+'ms  shown '+S+'ms  last '+Math.round(finalLat)+'ms  q'+q;draw();
- if(t-lastSend>5000){lastSend=t;report('&arrive_ms='+A+'&shown_ms='+S+'&last_ms='+Math.round(finalLat)+'&fps='+fps+'&decq='+q);}lastRep=t;}
-let cvInfo='';
-function draw(){st.textContent=mode+' '+fps+' fps\n'+info;}
-function tick(){fpsN++;const t=performance.now();if(t-fpsT>=1000){fps=fpsN;fpsN=0;fpsT=t;draw();}}
-const b64u8=b=>Uint8Array.from(atob(b),c=>c.charCodeAt(0));
-class Buf{constructor(){this.b=new Uint8Array(1<<20);this.o=0;this.n=0;}
- push(v){if(this.o&&this.b.length-this.n<v.length){this.b.copyWithin(0,this.o,this.n);this.n-=this.o;this.o=0;}
-  if(this.b.length-this.n<v.length){const t=new Uint8Array(Math.max(this.b.length*2,this.n+v.length));t.set(this.b.subarray(0,this.n));this.b=t;}
-  this.b.set(v,this.n);this.n+=v.length;}
- have(){return this.n-this.o;}
- u32(i){const b=this.b,o=this.o+i;return ((b[o]<<24)>>>0)+(b[o+1]<<16)+(b[o+2]<<8)+b[o+3];}
- take(k){const r=this.b.slice(this.o,this.o+k);this.o+=k;if(this.o===this.n){this.o=this.n=0;}return r;}}
-// audio: system sound arrives as SInt16 records (flag 4) -> AudioWorklet ring.
-// The context resumes on the first tap (autoplay policy); ~100ms prebuffer.
-let aCtx=null,aNode=null,aPend=[],aGo=false,aQueued=0;
-function audioInit(rate){
- try{
-  if(aCtx){try{if(aNode)aNode.disconnect();aCtx.close();}catch(e){}   // reconnect: drop the
-   aNode=null;aGo=false;aQueued=0;aPend.length=0;}                    // old graph + prebuffer state
-  aCtx=new AudioContext({latencyHint:'interactive',sampleRate:rate});
-  const src='class H extends AudioWorkletProcessor{constructor(){super();this.q=[];this.ri=0;this.go=false;'+
-   'this.port.onmessage=e=>{if(e.data===\'go\')this.go=true;else this.q.push(e.data)};};'+
-   'process(_,o){const L=o[0][0],R=o[0][1];if(!this.go)return true;'+
-   'for(let i=0;i<L.length;i++){while(this.q.length&&this.ri*2>=this.q[0].length){this.q.shift();this.ri=0;}'+
-   'const b=this.q[0];if(!b){L[i]=0;R[i]=0;}else{L[i]=b[this.ri*2];R[i]=b[this.ri*2+1];this.ri++;}}'+
-   'if(!this.q.length){this.go=false;this.port.postMessage(\'starved\');}'+   // underrun: re-prebuffer
-   'if(this.q.length>16){this.q.length=0;this.ri=0;}return true;}}'+
-   'registerProcessor(\'h\',H);';
-  const url=URL.createObjectURL(new Blob([src],{type:'application/javascript'}));
-  aCtx.audioWorklet.addModule(url).then(()=>{
-   aNode=new AudioWorkletNode(aCtx,'h',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2]});
-   aNode.port.onmessage=e=>{if(e.data==='starved'){aGo=false;aQueued=0;}}
-   aNode.connect(aCtx.destination);
-   aCtx.resume().catch(()=>{});
-  }).catch(()=>{});
- }catch(e){}
-}
-function audioFeed(i16){
- if(!aCtx||!aNode)return;
- if(!aGo&&aCtx.state!=='running'&&aQueued>aCtx.sampleRate*0.6)return;  // autoplay-blocked: don't pile up
- const f=new Float32Array(i16.length);
- for(let i=0;i<i16.length;i++)f[i]=i16[i]/32768;
- if(!aGo){aPend.push(f);aQueued+=f.length/2;
-  if(aQueued>=aCtx.sampleRate*0.1){
-   for(const b of aPend)aNode.port.postMessage(b);
-   aPend.length=0;aGo=true;aNode.port.postMessage('go');}
-  return;}
- aNode.port.postMessage(f);
-}
-// ---- input: the receiver becomes a touchscreen -------------------------
-// full gesture engine -> POST /input; the Mac replays native events:
-//   1 finger: tap (single/double/triple click), long-press = right click,
-//             drag; drag started right after a double-tap = word-select
-//   2 fingers: tap = right click, swipe = scroll, pinch = zoom (Cmd+wheel)
-//   3+ fingers: tap = middle click, swipe = Spaces / Mission Control /
-//              App Windows (iPadOS claims some of these - see README)
-// aspect comes from the visible element's own bitmap, so it works for both
-// the h264 canvas and the mjpeg img regardless of letterboxing.
-let lastTouch=0,lastInp=0,mvT=0,chainN=0,chainT=0,chainPt=null,inputOn=null;
-// windowed = page control (tap restores fullscreen); fullscreen = Mac input.
-// fsBroken: browser refused fullscreen (e.g. API missing) -> input stays on.
-// inputOn: runtime presenter-mode toggle (server /input/toggle); null = unknown.
-const inpOn=()=>armed&&inputOn!==false&&(document.fullscreenElement||fsBroken);
-const G={state:'',t0:0,start:[0,0],mode:'',fired:false,drag:false,lpT:0,lpFired:false,
-         sep0:0,sepPrev:null,scPrev:null,scT:0,cx0:0,cy0:0,gx:0,gy:0};
-function normXY(cx,cy){
- const el=cv.style.display==='none'?img:cv;
- const W=el===cv?cv.width:(img.naturalWidth||0),H=el===cv?cv.height:(img.naturalHeight||0);
- if(!W||!H)return null;
- // measure the ELEMENT (not innerWidth/Height: 100vh on iPad can exceed the
- // visible viewport, which would shift the object-fit letterbox)
- const r=el.getBoundingClientRect();
- let w=r.width,h=r.width*H/W;
- if(h>r.height){h=r.height;w=r.height*W/H;}
- const x=(cx-(r.left+(r.width-w)/2))/w,y=(cy-(r.top+(r.height-h)/2))/h;
- return [x<0?0:x>1?1:x,y<0?0:y>1?1:y];
-}
-function ripple(x,y){                            // visual: where a tap registered
- const d=document.createElement('div');
- d.style.cssText='position:fixed;left:'+x+'px;top:'+y+'px;width:26px;height:26px;'
-  +'border:2px solid rgba(255,255,255,.9);border-radius:50%;pointer-events:none;'
-  +'transform:translate(-50%,-50%);transition:opacity .35s,width .35s,height .35s;opacity:.9';
- document.body.appendChild(d);
- requestAnimationFrame(()=>{d.style.width='70px';d.style.height='70px';d.style.opacity='0';});
- setTimeout(()=>d.remove(),400);
-}
-// single-flight event queue: one POST in flight at a time, order preserved
-// (fetches over separate connections can otherwise arrive out of order and
-// turn down+move+up into garbage). Consecutive trailing moves coalesce.
-let iqBusy=false,iqQ=[];
-function inp(o){
- lastInp=Date.now();
- if(o.t==='move'){while(iqQ.length&&iqQ[iqQ.length-1].t==='move')iqQ.pop();}
- iqQ.push(o);
- if(iqQ.length>40)iqQ.splice(0,iqQ.length-40);          // flood cap
- iqFlush();
-}
-function iqFlush(){
- if(iqBusy||!iqQ.length)return;iqBusy=true;
- const o=iqQ.shift();
- fetch('/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})
-  .catch(()=>{}).finally(()=>{iqBusy=false;iqFlush();});
-}
-function pos(T){let x=0,y=0;for(const t of T){x+=t.clientX;y+=t.clientY;}return [x/T.length,y/T.length];}
-// scroll pipeline: one POST in flight (order + coalescing), flick acceleration,
-// glide after lift. Every scroll carries the finger position so the Mac can
-// warp the cursor — wheel events otherwise hit whatever screen the real mouse
-// was last on, not the window under the fingers.
-let scBusy=false,scAcc=[0,0],scAt=[0.5,0.5],scMom=0;
-function scSend(dx,dy,at){
- if(at){scAt[0]=at[0];scAt[1]=at[1];}
- if(scBusy){scAcc[0]+=dx;scAcc[1]+=dy;return;}
- scBusy=true;const px=scAt[0],py=scAt[1];
- fetch('/input',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({t:'scroll',dx:dx,dy:dy,x:px,y:py})}).catch(()=>{}).finally(()=>{
-   scBusy=false;
-   if(scAcc[0]||scAcc[1]){const x=scAcc[0],y=scAcc[1];scAcc[0]=scAcc[1]=0;scSend(x,y);}
-  });
-}
-function scPost(dx,dy,at){                        // finger delta -> accelerated wheel
- const m=1.9+Math.min(2.4,Math.hypot(dx,dy)*0.008);
- scSend(Math.round(dx*m),Math.round(dy*m),at);
-}
-function gReset(){G.state='';G.mode='';G.fired=false;G.drag=false;G.lpFired=false;
- clearTimeout(G.lpT);G.sepPrev=null;G.scPrev=null;G.vx=G.vy=0;G.vt=0;}
-function abortInput(){                           // never leave the Mac's button held
- clearInterval(scMom);clearTimeout(G.lpT);
- if(G.drag){G.drag=false;inp({t:'up'});}
- gReset();
-}
-addEventListener('touchcancel',abortInput);
-addEventListener('blur',abortInput);
-addEventListener('pagehide',abortInput);
-document.addEventListener('visibilitychange',()=>{if(document.hidden)abortInput();});
-document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement)abortInput();});
-addEventListener('touchstart',e=>{
- lastTouch=Date.now();
- clearInterval(scMom);                           // touching stops any glide
- if(drOpen&&!uiEl(e.target)){openDr(false);return;}   // tap outside closes it, swallows the tap
- if(uiEl(e.target))return;                            // drawer/tab never click the Mac
- if(!inpOn())return;
- const T=e.touches,n=T.length;
- if(n===1){
-  const p=normXY(T[0].clientX,T[0].clientY);if(!p)return;
-  G.rx=T[0].clientX;G.ry=T[0].clientY;         // raw px for the ripple
-  // multi-tap chain: this touch continues a recent tap at the same spot
-  if(chainN&&chainN<3&&Date.now()-chainT<320&&chainPt&&
-     Math.abs(p[0]-chainPt[0])+Math.abs(p[1]-chainPt[1])<0.06)chainN++;
-  else chainN=1;
-  gReset();G.state='touch';G.t0=Date.now();G.start=p;
-  G.lpT=setTimeout(()=>{if(G.state==='touch'&&!G.drag){G.lpFired=true;chainN=0;
-   ripple(G.rx,G.ry);inp({t:'rclick',x:G.start[0],y:G.start[1]});}},480);
- }else{                                          // extra fingers: upgrade gesture
-  clearTimeout(G.lpT);
-  if(G.drag)inp({t:'up'});G.drag=false;
-  const prev=G.state;                            // mid-gesture upgrades never count as taps
-  const p=pos(T);G.state=n===2?'two':'multi';G.t0=Date.now();G.mode='';
-  G.fired=prev!=='';
-  G.cx0=p[0];G.cy0=p[1];G.scPrev=null;G.sepPrev=null;
-  if(n===2)G.sep0=Math.hypot(T[0].clientX-T[1].clientX,T[0].clientY-T[1].clientY);
-  const q=normXY(p[0],p[1]);if(q)G.start=q;
- }
-},{passive:false});
-addEventListener('touchmove',e=>{
- lastTouch=Date.now();                           // long gestures keep synthetic-mouse suppression armed
- if(drOpen||uiEl(e.target))return;               // drawer open: let it scroll natively
- if(!inpOn())return;
- e.preventDefault();
- const T=e.touches,n=T.length;
- if(n===1&&G.state==='touch'){
-  const p=normXY(T[0].clientX,T[0].clientY);if(!p)return;
-  const d=Math.abs(p[0]-G.start[0])+Math.abs(p[1]-G.start[1]);
-  if(G.drag){
-   if(Date.now()-mvT>30){mvT=Date.now();inp({t:'move',x:p[0],y:p[1]});}
-  }else if(!G.lpFired&&d>0.012){                 // deliberate move -> drag
-   clearTimeout(G.lpT);
-   const c=chainN>1?2:1;                        // double-tap-drag = word select
-   chainN=0;G.drag=true;mvT=Date.now();
-   inp({t:'down',x:G.start[0],y:G.start[1],c:c});inp({t:'move',x:p[0],y:p[1]});
-  }
-  return;
- }
- if(n===2&&G.state==='two'){
-  const c=pos(T),sep=Math.hypot(T[0].clientX-T[1].clientX,T[0].clientY-T[1].clientY);
-  const now=Date.now();
-  const q=normXY(c[0],c[1]);if(q){G.sx=q[0];G.sy=q[1];}   // gesture position
-  if(!G.mode){                                   // classify with hysteresis
-   if(Math.abs(sep-G.sep0)>28)G.mode='pinch';
-   else if(Math.hypot(c[0]-G.cx0,c[1]-G.cy0)>10)G.mode='scroll';
-   else return;
-  }
-  if(G.mode==='pinch'){
-   if(now-mvT>40){const dz=sep-(G.sepPrev!=null?G.sepPrev:G.sep0);G.sepPrev=sep;mvT=now;
-    inp({t:'scroll',zoom:1,dy:dz*2,x:G.sx,y:G.sy});}
-  }else{                                         // scroll: accelerated, ordered, positioned
-   if(!G.scPrev){G.scPrev=c;G.scT=now;G.vx=G.vy=0;return;}
-   if(now-G.scT>=40){
-    const dx=c[0]-G.scPrev[0],dy=c[1]-G.scPrev[1];   // sign: content follows fingers
-    G.vx=dx/(now-G.scT);G.vy=dy/(now-G.scT);G.vt=now;// px/ms, seeds the glide
-    scPost(dx,dy,[G.sx,G.sy]);
-    G.scT=now;G.scPrev=c;
-   }
-  }
-  return;
- }
- // NOTE: no 3/4-finger SWIPE mappings — iPadOS claims those gestures first
- // (3-finger swipe = screenshot / undo, 4/5-finger = multitasking) and the
- // browser never sees them. Quick multi-finger TAPS are not claimed -> kept
- // below as middle click.
-},{passive:false});
-addEventListener('touchend',e=>{
- lastTouch=Date.now();
- if(!armed&&!G.drag)return;              // still finish a drag after losing fullscreen
- clearTimeout(G.lpT);
- if(e.touches.length)return;                     // fingers remain: gesture continues
- const dt=Date.now()-G.t0;
- if(G.drag)inp({t:'up'});
- else if(G.state==='two'&&!G.mode&&!G.fired&&dt<300){ripple(G.rx,G.ry);inp({t:'rclick',x:G.start[0],y:G.start[1]});}
- else if(G.state==='multi'&&!G.fired&&dt<300){ripple(G.rx,G.ry);inp({t:'mclick',x:G.start[0],y:G.start[1]});}
- else if(G.state==='touch'&&!G.lpFired){
-  chainT=Date.now();chainPt=G.start;             // remember for the chain window
-  ripple(G.rx,G.ry);
-  inp({t:'tap',x:G.start[0],y:G.start[1],c:Math.min(chainN,3)});
- }
- else if(G.state==='two'&&G.mode==='scroll'&&(G.vx||G.vy)&&Date.now()-G.vt<140){   // fresh flick -> glide
-  let vx=G.vx,vy=G.vy;clearInterval(scMom);
-  scMom=setInterval(()=>{
-   if(!inpOn()){clearInterval(scMom);return;}
-   vx*=0.90;vy*=0.90;
-   if(Math.hypot(vx,vy)<0.015){clearInterval(scMom);return;}
-   scPost(vx*40,vy*40,[G.sx,G.sy]);},40);
- }
- gReset();
-},{passive:false});
-// mouse + wheel: a laptop browser drives the Mac too (hover, drag, wheel;
-// ctrl+wheel = trackpad pinch -> Mac zoom). dblclick = double-click on the
-// Mac AND toggles the stats overlay (plain taps click the Mac now).
-// lastTouch (real touches only) swallows Safari's synthetic mouse events.
-addEventListener('mousedown',e=>{if(!inpOn()||Date.now()-lastTouch<800||e.button!==0)return;
- if(drOpen&&!uiEl(e.target)){openDr(false);return;}
- if(uiEl(e.target))return;
- const p=normXY(e.clientX,e.clientY);if(!p)return;G.drag=true;
- inp({t:'down',x:p[0],y:p[1],c:Math.max(1,Math.min(3,e.detail||1))});});
-addEventListener('mousemove',e=>{if(!inpOn()||Date.now()-lastTouch<800||Date.now()-mvT<=30)return;
- mvT=Date.now();const p=normXY(e.clientX,e.clientY);if(p)inp({t:'move',x:p[0],y:p[1]});});
-addEventListener('mouseup',()=>{if(G.drag){G.drag=false;inp({t:'up'});}});
-addEventListener('dblclick',e=>{if(!inpOn()||Date.now()-lastTouch<800)return;
- openDr(!drOpen);});
-addEventListener('wheel',e=>{if(!inpOn()||Date.now()-lastTouch<800)return;
- const p=normXY(e.clientX,e.clientY)||[0.5,0.5];
- if(e.ctrlKey)inp({t:'scroll',zoom:1,dy:-e.deltaY,x:p[0],y:p[1]});   // trackpad pinch
- else inp({t:'scroll',dx:-e.deltaX,dy:-e.deltaY,x:p[0],y:p[1]});},{passive:true});
-// ---- side drawer: stats + input control. Nothing floats over the picture:
-// a small ⓘ tab on the right edge summons it; it slides away when done.
-// The input control obeys the backend: it can only flip what the server
-// allows (input_wanted + input_trusted from /status).
-const dr=document.createElement('div');dr.id='dr';
-dr.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">'
- +'<b>HoppScreen</b><button id=drx style="background:none;border:none;color:#999;font:20px system-ui;padding:2px 8px">\u2715</button></div>';
-document.body.appendChild(dr);
-dr.appendChild(st);                                 // the stats block lives in here now
-const tab=document.createElement('div');tab.id='tab';tab.textContent='\u24d8';
-document.body.appendChild(tab);
-setTimeout(()=>tab.classList.add('dim'),4000);      // fades to a whisper after settling in
-let drOpen=false;
-function openDr(v){drOpen=!!v;dr.classList.toggle('on',drOpen);}
-tab.addEventListener('click',e=>{e.stopPropagation();tab.classList.remove('dim');openDr(!drOpen);});
-tab.addEventListener('touchend',e=>{e.stopPropagation();e.preventDefault();tab.classList.remove('dim');openDr(!drOpen);},{passive:false});
-dr.querySelector('#drx').addEventListener('click',e=>{e.stopPropagation();openDr(false);});
-function uiEl(t){return !!(t&&t.closest&&t.closest('#dr,#tab'));}
-// input control: shown once /status says whether the backend permits input
-let inputAllowed=null,inputWhy='';
-const inSec=document.createElement('div');inSec.style.cssText='margin-top:16px';
-const inHdr=document.createElement('div');inHdr.textContent='Input';
-inHdr.style.cssText='font-weight:600;margin-bottom:6px;color:#eee';
-const btnIn=document.createElement('button');
-btnIn.style.cssText='width:100%;padding:10px;margin-top:2px;border-radius:8px;border:1px solid rgba(255,255,255,.35);background:rgba(0,0,0,.6);color:#fff;font:14px system-ui';
-const inWhy=document.createElement('div');
-inWhy.style.cssText='font:12px system-ui;color:#999;margin-top:6px;line-height:1.4';
-inSec.appendChild(inHdr);inSec.appendChild(btnIn);inSec.appendChild(inWhy);
-inSec.style.display='none';
-dr.appendChild(inSec);
-function updInput(){
- if(inputAllowed===null){inSec.style.display='none';return;}
- inSec.style.display='block';
- if(!inputAllowed){
-  btnIn.disabled=true;btnIn.style.opacity=.55;btnIn.textContent='\uD83D\uDD12 Input unavailable';
-  inWhy.textContent=inputWhy;return;
- }
- btnIn.disabled=false;btnIn.style.opacity=1;
- btnIn.textContent=inputOn===false?'\uD83D\uDD12 View-only — tap to control':'\uD83D\uDC58 Controlling the Mac — tap for view-only';
- inWhy.textContent=inputOn===false?'input is disabled; touches do nothing':'your touches click the Mac';
-}
-function toggleInp(){
- if(inputAllowed!==true)return;
- fetch('/input/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
-  .then(r=>r.text()).then(t=>{inputOn=t==='on';updInput();}).catch(()=>{});
-}
-btnIn.addEventListener('click',e=>{e.stopPropagation();toggleInp();});
-btnIn.addEventListener('touchend',e=>{e.stopPropagation();e.preventDefault();toggleInp();},{passive:false});
-async function startH264(){
- const res=await fetch('/h264',{cache:'no-store'});
- if(res.status===401){location.reload();throw new Error('401');}   // login lost: 401 on / re-prompts
- if(!res.ok||!res.body)throw new Error('no h264');
- await clockSync().catch(()=>{});
- const rd=res.body.getReader();const buf=new Buf();let cfg=null,dec=null,g=null,bad=false;
- try{
-  while(alive&&!bad){
-   const {done,value}=await rd.read();if(done)break;buf.push(value);
-   if(!cfg){if(buf.have()<4)continue;const L=buf.u32(0);if(buf.have()<4+L)continue;
-    buf.take(4);cfg=JSON.parse(new TextDecoder().decode(buf.take(L)));
-    if(cv.width!==cfg.w||cv.height!==cfg.h){cv.width=cfg.w;cv.height=cfg.h;}
-    g=cv.getContext('2d',{alpha:false,desynchronized:true});
-    dec=new VideoDecoder({output:f=>{g.drawImage(f,0,0,cv.width,cv.height);if(rep.delete(f.timestamp)){}else{finalLat=srvNow()-f.timestamp/1000;latS.push(finalLat);}f.close();tick();latTick(dec.decodeQueueSize);},
-     error:e=>{console.warn(e);bad=true;report('&err='+encodeURIComponent('decoder: '+e.message));}});
-    const c={codec:cfg.codec,description:b64u8(cfg.desc),optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'};
-    try{if(!(await VideoDecoder.isConfigSupported(c)).supported)delete c.hardwareAcceleration;}catch(e){delete c.hardwareAcceleration;}
-    dec.configure(c);cv.style.display='block';img.style.display='none';
-    cvInfo=info=cfg.w+'x'+cfg.h+' '+cfg.codec+(cfg.arate?' +audio':'');report();
-    if(cfg.arate)audioInit(cfg.arate);
-   }
-   while(buf.have()>=13){const L=buf.u32(0);if(buf.have()<13+L)break;
-    const fl=buf.b[buf.o+4],ts=buf.u32(5)*4294967296+buf.u32(9);buf.take(13);const data=buf.take(L);
-    if(fl&4){if(L>3)audioFeed(new Int16Array(data.buffer,data.byteOffset,L>>1));continue;}
-    if(fl&2)rep.add(ts);else latA.push(srvNow()-ts/1000);
-    if(L>0&&dec.state==='configured')dec.decode(new EncodedVideoChunk({type:(fl&1)?'key':'delta',timestamp:ts,data}));
-   }
-  }
- }finally{try{rd.cancel();}catch(e){}try{if(dec&&dec.state!=='closed')dec.close();}catch(e){}}
-}
-function startMjpeg(){mode='mjpeg';report();img.style.display='block';cv.style.display='none';
- img.onerror=()=>{if(alive)setTimeout(()=>{img.src='/stream.mjpg?t='+Date.now();},900);};
- img.onload=()=>tick();img.src='/stream.mjpg?t='+Date.now();}
-async function fit(){try{const s=await(await fetch('/status',{cache:'no-store'})).json();
- if('input' in s){
-  inputOn=!!s.input;
-  inputAllowed=s.input_wanted!==false&&s.input_trusted!==false;
-  inputWhy=s.input_wanted===false?'the Mac is running view-only (started with INPUT=0)'
-           :'allow hoppscreen on the Mac: System Settings > Privacy & Security > Accessibility';
-  updInput();
- }
- const W=Math.round(screen.width*devicePixelRatio),H=Math.round(screen.height*devicePixelRatio);
- if(!W||!H||W<500||H<500)return;if(Math.abs(W-s.pixel_width)<=W/8&&Math.abs(H-s.pixel_height)<=H/8)return;
- let hz=0;const d=[];let n=0;await new Promise(r=>requestAnimationFrame(function f(t){d.push(t);if(++n>=24)r();else requestAnimationFrame(f)}));
- if(d.length>5){const dt=d[d.length-1]-d[0];if(dt>0)hz=Math.round(1000*(d.length-1)/dt);}
- await fetch('/fit',{method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',
-  body:JSON.stringify({w:W,h:H,dpr:devicePixelRatio,hz:hz||60})});
-}catch(e){}}
-async function start(){
- alive=true;st.style.display='block';
- fit();
- if(WC){mode='h264';
-  while(alive){try{await startH264();}catch(e){console.warn(e);report('&err='+encodeURIComponent(String(e&&e.message||e)));}
-   if(!alive)break;await new Promise(r=>setTimeout(r,500));}
- } else startMjpeg();
-}
-const wv=$('w');
-function keepAwake(){if(wv.paused)wv.play().catch(()=>{});try{navigator.wakeLock&&navigator.wakeLock.request('screen').catch(()=>{});}catch(e){}}
-let fsBroken=false;
-async function goFull(){try{if(!document.fullscreenElement)await document.documentElement.requestFullscreen({navigationUI:'hide'});}catch(e){fsBroken=true;}
- try{await screen.orientation.lock('landscape');}catch(e){}}
-// stream starts immediately (decoder warm before the tap); fullscreen needs a user gesture
-start();
-let armed=false;
-document.addEventListener('click',async e=>{
- if(uiEl(e.target))return;
- if(drOpen){openDr(false);return;}
- if(!armed){armed=true;ui.remove();await goFull();
-  if(aCtx&&aCtx.state!=='running')aCtx.resume().catch(()=>{});
-  wv.src='/silent.mp4';wv.volume=0;await wv.play().catch(()=>{});keepAwake();setInterval(keepAwake,5000);
-  setTimeout(fit,1200);                          // re-fit after orientation settles
-  return;}
- if(!document.fullscreenElement){goFull();return;}   // left fullscreen: any tap restores it
- if(Date.now()-lastTouch<800||Date.now()-lastInp<800)return;   // input already acted
- openDr(!drOpen);                                  // plain click (no input action): drawer
-});
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)keepAwake();});
-</script></body></html>
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no"
+    />
+    <title>HoppScreen</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      #c,
+      #s {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        object-fit: contain;
+        touch-action: none;
+        display: none;
+      }
+      #ui {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 22px;
+        align-items: center;
+        justify-content: center;
+        background: #000;
+        z-index: 9;
+        color: #bbb;
+        font:
+          17px system-ui,
+          sans-serif;
+        text-align: center;
+        padding: 24px;
+      }
+      #warn {
+        color: #fb4;
+        max-width: 820px;
+        line-height: 1.5;
+        display: none;
+      }
+      #warn code {
+        background: #222;
+        padding: 2px 6px;
+        border-radius: 4px;
+        color: #fff;
+      }
+      #st {
+        color: #7f7;
+        font: 13px monospace;
+        white-space: pre;
+        pointer-events: none;
+        text-align: left;
+        line-height: 1.5;
+      }
+      #dr {
+        position: fixed;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        width: 290px;
+        max-width: 72vw;
+        background: rgba(10, 10, 14, 0.93);
+        color: #ddd;
+        z-index: 12;
+        transform: translateX(105%);
+        transition: transform 0.25s;
+        padding: 16px;
+        box-sizing: border-box;
+        font: 14px system-ui;
+        overflow-y: auto;
+      }
+      #dr.on {
+        transform: none;
+      }
+      #tab {
+        position: fixed;
+        top: 50%;
+        right: 0;
+        transform: translateY(-50%);
+        z-index: 11;
+        background: rgba(10, 10, 14, 0.72);
+        color: #ccc;
+        border-radius: 12px 0 0 12px;
+        padding: 22px 7px;
+        font: 17px system-ui;
+        user-select: none;
+        opacity: 0.55;
+        transition: opacity 0.9s;
+      }
+      #tab.dim {
+        opacity: 0.12;
+      }
+      button {
+        font-size: 22px;
+        padding: 18px 34px;
+        border-radius: 14px;
+        border: 0;
+        background: #1a73e8;
+        color: #fff;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="c"></canvas><img id="s" alt="" /><video
+      id="w"
+      playsinline
+      loop
+      muted
+      preload="none"
+      style="position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0.01"
+    ></video>
+    <div id="st"></div>
+    <div id="ui">
+      <button id="go">&#9654; TAP FOR FULLSCREEN</button>
+      <div id="warn"></div>
+      <div style="color: #666; font-size: 14px">
+        tap the screen later to show/hide fps &middot; tap again after leaving fullscreen
+      </div>
+    </div>
+    <script>
+      const $ = (i) => document.getElementById(i);
+      const cv = $("c"),
+        img = $("s"),
+        st = $("st"),
+        ui = $("ui");
+      const WC = "VideoDecoder" in window;
+      let alive = false,
+        mode = "",
+        fpsN = 0,
+        fpsT = 0,
+        fps = 0,
+        info = "";
+      if (!WC) {
+        const w = $("warn");
+        w.style.display = "block";
+        w.innerHTML =
+          "&#9888; Sharp low-latency H.264 needs a secure page. Falling back to MJPEG (blurry + laggy).";
+        fetch("/status", { cache: "no-store" })
+          .then((r) => r.json())
+          .then((j) => {
+            if (!j.tls_port) return;
+            const u = "https://" + location.hostname + ":" + j.tls_port + "/";
+            if (!sessionStorage.triedTls) {
+              sessionStorage.triedTls = 1;
+              location.replace(u);
+              return;
+            }
+            w.innerHTML +=
+              '<br><br>Open the secure page: <a style="color:#8cf" href="' +
+              u +
+              '">' +
+              u +
+              "</a> (tap Advanced &rarr; Proceed to ignore the warning)<br>" +
+              'or install the CA once: download <a style="color:#8cf" href="/ca.crt">ca.crt</a> and add it under Settings &rarr; Security &rarr; Encryption &amp; credentials &rarr; Install a certificate &rarr; CA certificate.';
+          })
+          .catch(() => {});
+      }
+      function report(x) {
+        fetch(
+          "/hello?mode=" +
+            mode +
+            "&secure=" +
+            (window.isSecureContext ? 1 : 0) +
+            "&screen=" +
+            Math.round(screen.width * devicePixelRatio) +
+            "x" +
+            Math.round(screen.height * devicePixelRatio) +
+            "&dpr=" +
+            devicePixelRatio +
+            (x || ""),
+          { cache: "no-store" },
+        ).catch(() => {});
+      }
+      // latency instrumentation: frames carry their Mac capture time; clock offset via /time
+      let off = 0,
+        latA = [],
+        latS = [],
+        lastRep = 0,
+        lastSend = 0,
+        finalLat = 0;
+      const rep = new Set();
+      const srvNow = () => performance.timeOrigin + performance.now() + off;
+      async function clockSync() {
+        let best = 1e9;
+        for (let i = 0; i < 6; i++) {
+          const t0 = performance.now();
+          const v = +(await (await fetch("/time", { cache: "no-store" })).text());
+          const t1 = performance.now();
+          if (t1 - t0 < best) {
+            best = t1 - t0;
+            off = v / 1000 - (performance.timeOrigin + (t0 + t1) / 2);
+          }
+        }
+      }
+      const med = (a) => {
+        if (!a.length) return 0;
+        const b = [...a].sort((x, y) => x - y);
+        return Math.round(b[b.length >> 1]);
+      };
+      function latTick(q) {
+        const t = performance.now();
+        if (t - lastRep < 1000) return;
+        const A = med(latA),
+          S = med(latS);
+        latA = [];
+        latS = [];
+        info =
+          cvInfo +
+          "\nlatency: arrive " +
+          A +
+          "ms  shown " +
+          S +
+          "ms  last " +
+          Math.round(finalLat) +
+          "ms  q" +
+          q;
+        draw();
+        if (t - lastSend > 5000) {
+          lastSend = t;
+          report(
+            "&arrive_ms=" +
+              A +
+              "&shown_ms=" +
+              S +
+              "&last_ms=" +
+              Math.round(finalLat) +
+              "&fps=" +
+              fps +
+              "&decq=" +
+              q,
+          );
+        }
+        lastRep = t;
+      }
+      let cvInfo = "";
+      function draw() {
+        st.textContent = mode + " " + fps + " fps\n" + info;
+      }
+      function tick() {
+        fpsN++;
+        const t = performance.now();
+        if (t - fpsT >= 1000) {
+          fps = fpsN;
+          fpsN = 0;
+          fpsT = t;
+          draw();
+        }
+      }
+      const b64u8 = (b) => Uint8Array.from(atob(b), (c) => c.charCodeAt(0));
+      class Buf {
+        constructor() {
+          this.b = new Uint8Array(1 << 20);
+          this.o = 0;
+          this.n = 0;
+        }
+        push(v) {
+          if (this.o && this.b.length - this.n < v.length) {
+            this.b.copyWithin(0, this.o, this.n);
+            this.n -= this.o;
+            this.o = 0;
+          }
+          if (this.b.length - this.n < v.length) {
+            const t = new Uint8Array(Math.max(this.b.length * 2, this.n + v.length));
+            t.set(this.b.subarray(0, this.n));
+            this.b = t;
+          }
+          this.b.set(v, this.n);
+          this.n += v.length;
+        }
+        have() {
+          return this.n - this.o;
+        }
+        u32(i) {
+          const b = this.b,
+            o = this.o + i;
+          return ((b[o] << 24) >>> 0) + (b[o + 1] << 16) + (b[o + 2] << 8) + b[o + 3];
+        }
+        take(k) {
+          const r = this.b.slice(this.o, this.o + k);
+          this.o += k;
+          if (this.o === this.n) {
+            this.o = this.n = 0;
+          }
+          return r;
+        }
+      }
+      // audio: system sound arrives as SInt16 records (flag 4) -> AudioWorklet ring.
+      // The context resumes on the first tap (autoplay policy); ~100ms prebuffer.
+      let aCtx = null,
+        aNode = null,
+        aPend = [],
+        aGo = false,
+        aQueued = 0;
+      function audioInit(rate) {
+        try {
+          if (aCtx) {
+            try {
+              if (aNode) aNode.disconnect();
+              aCtx.close();
+            } catch (e) {} // reconnect: drop the
+            aNode = null;
+            aGo = false;
+            aQueued = 0;
+            aPend.length = 0;
+          } // old graph + prebuffer state
+          aCtx = new AudioContext({ latencyHint: "interactive", sampleRate: rate });
+          const src =
+            "class H extends AudioWorkletProcessor{constructor(){super();this.q=[];this.ri=0;this.go=false;" +
+            "this.port.onmessage=e=>{if(e.data==='go')this.go=true;else this.q.push(e.data)};};" +
+            "process(_,o){const L=o[0][0],R=o[0][1];if(!this.go)return true;" +
+            "for(let i=0;i<L.length;i++){while(this.q.length&&this.ri*2>=this.q[0].length){this.q.shift();this.ri=0;}" +
+            "const b=this.q[0];if(!b){L[i]=0;R[i]=0;}else{L[i]=b[this.ri*2];R[i]=b[this.ri*2+1];this.ri++;}}" +
+            "if(!this.q.length){this.go=false;this.port.postMessage('starved');}" + // underrun: re-prebuffer
+            "if(this.q.length>16){this.q.length=0;this.ri=0;}return true;}}" +
+            "registerProcessor('h',H);";
+          const url = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
+          aCtx.audioWorklet
+            .addModule(url)
+            .then(() => {
+              aNode = new AudioWorkletNode(aCtx, "h", {
+                numberOfInputs: 0,
+                numberOfOutputs: 1,
+                outputChannelCount: [2],
+              });
+              aNode.port.onmessage = (e) => {
+                if (e.data === "starved") {
+                  aGo = false;
+                  aQueued = 0;
+                }
+              };
+              aNode.connect(aCtx.destination);
+              aCtx.resume().catch(() => {});
+            })
+            .catch(() => {});
+        } catch (e) {}
+      }
+      function audioFeed(i16) {
+        if (!aCtx || !aNode) return;
+        if (!aGo && aCtx.state !== "running" && aQueued > aCtx.sampleRate * 0.6) return; // autoplay-blocked: don't pile up
+        const f = new Float32Array(i16.length);
+        for (let i = 0; i < i16.length; i++) f[i] = i16[i] / 32768;
+        if (!aGo) {
+          aPend.push(f);
+          aQueued += f.length / 2;
+          if (aQueued >= aCtx.sampleRate * 0.1) {
+            for (const b of aPend) aNode.port.postMessage(b);
+            aPend.length = 0;
+            aGo = true;
+            aNode.port.postMessage("go");
+          }
+          return;
+        }
+        aNode.port.postMessage(f);
+      }
+      // ---- input: the receiver becomes a touchscreen -------------------------
+      // full gesture engine -> POST /input; the Mac replays native events:
+      //   1 finger: tap (single/double/triple click), long-press = right click,
+      //             drag; drag started right after a double-tap = word-select
+      //   2 fingers: tap = right click, swipe = scroll, pinch = zoom (Cmd+wheel)
+      //   3+ fingers: tap = middle click, swipe = Spaces / Mission Control /
+      //              App Windows (iPadOS claims some of these - see README)
+      // aspect comes from the visible element's own bitmap, so it works for both
+      // the h264 canvas and the mjpeg img regardless of letterboxing.
+      let lastTouch = 0,
+        lastInp = 0,
+        mvT = 0,
+        chainN = 0,
+        chainT = 0,
+        chainPt = null,
+        inputOn = null;
+      // windowed = page control (tap restores fullscreen); fullscreen = Mac input.
+      // fsBroken: browser refused fullscreen (e.g. API missing) -> input stays on.
+      // inputOn: runtime presenter-mode toggle (server /input/toggle); null = unknown.
+      const inpOn = () => armed && inputOn !== false && (document.fullscreenElement || fsBroken);
+      const G = {
+        state: "",
+        t0: 0,
+        start: [0, 0],
+        mode: "",
+        fired: false,
+        drag: false,
+        lpT: 0,
+        lpFired: false,
+        sep0: 0,
+        sepPrev: null,
+        scPrev: null,
+        scT: 0,
+        cx0: 0,
+        cy0: 0,
+        gx: 0,
+        gy: 0,
+      };
+      function normXY(cx, cy) {
+        const el = cv.style.display === "none" ? img : cv;
+        const W = el === cv ? cv.width : img.naturalWidth || 0,
+          H = el === cv ? cv.height : img.naturalHeight || 0;
+        if (!W || !H) return null;
+        // measure the ELEMENT (not innerWidth/Height: 100vh on iPad can exceed the
+        // visible viewport, which would shift the object-fit letterbox)
+        const r = el.getBoundingClientRect();
+        let w = r.width,
+          h = (r.width * H) / W;
+        if (h > r.height) {
+          h = r.height;
+          w = (r.height * W) / H;
+        }
+        const x = (cx - (r.left + (r.width - w) / 2)) / w,
+          y = (cy - (r.top + (r.height - h) / 2)) / h;
+        return [x < 0 ? 0 : x > 1 ? 1 : x, y < 0 ? 0 : y > 1 ? 1 : y];
+      }
+      function ripple(x, y) {
+        // visual: where a tap registered
+        const d = document.createElement("div");
+        d.style.cssText =
+          "position:fixed;left:" +
+          x +
+          "px;top:" +
+          y +
+          "px;width:26px;height:26px;" +
+          "border:2px solid rgba(255,255,255,.9);border-radius:50%;pointer-events:none;" +
+          "transform:translate(-50%,-50%);transition:opacity .35s,width .35s,height .35s;opacity:.9";
+        document.body.appendChild(d);
+        requestAnimationFrame(() => {
+          d.style.width = "70px";
+          d.style.height = "70px";
+          d.style.opacity = "0";
+        });
+        setTimeout(() => d.remove(), 400);
+      }
+      // single-flight event queue: one POST in flight at a time, order preserved
+      // (fetches over separate connections can otherwise arrive out of order and
+      // turn down+move+up into garbage). Consecutive trailing moves coalesce.
+      let iqBusy = false,
+        iqQ = [];
+      function inp(o) {
+        lastInp = Date.now();
+        if (o.t === "move") {
+          while (iqQ.length && iqQ[iqQ.length - 1].t === "move") iqQ.pop();
+        }
+        iqQ.push(o);
+        if (iqQ.length > 40) iqQ.splice(0, iqQ.length - 40); // flood cap
+        iqFlush();
+      }
+      function iqFlush() {
+        if (iqBusy || !iqQ.length) return;
+        iqBusy = true;
+        const o = iqQ.shift();
+        fetch("/input", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(o),
+        })
+          .catch(() => {})
+          .finally(() => {
+            iqBusy = false;
+            iqFlush();
+          });
+      }
+      function pos(T) {
+        let x = 0,
+          y = 0;
+        for (const t of T) {
+          x += t.clientX;
+          y += t.clientY;
+        }
+        return [x / T.length, y / T.length];
+      }
+      // scroll pipeline: one POST in flight (order + coalescing), flick acceleration,
+      // glide after lift. Every scroll carries the finger position so the Mac can
+      // warp the cursor — wheel events otherwise hit whatever screen the real mouse
+      // was last on, not the window under the fingers.
+      let scBusy = false,
+        scAcc = [0, 0],
+        scAt = [0.5, 0.5],
+        scMom = 0;
+      function scSend(dx, dy, at) {
+        if (at) {
+          scAt[0] = at[0];
+          scAt[1] = at[1];
+        }
+        if (scBusy) {
+          scAcc[0] += dx;
+          scAcc[1] += dy;
+          return;
+        }
+        scBusy = true;
+        const px = scAt[0],
+          py = scAt[1];
+        fetch("/input", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ t: "scroll", dx: dx, dy: dy, x: px, y: py }),
+        })
+          .catch(() => {})
+          .finally(() => {
+            scBusy = false;
+            if (scAcc[0] || scAcc[1]) {
+              const x = scAcc[0],
+                y = scAcc[1];
+              scAcc[0] = scAcc[1] = 0;
+              scSend(x, y);
+            }
+          });
+      }
+      function scPost(dx, dy, at) {
+        // finger delta -> accelerated wheel
+        const m = 1.9 + Math.min(2.4, Math.hypot(dx, dy) * 0.008);
+        scSend(Math.round(dx * m), Math.round(dy * m), at);
+      }
+      function gReset() {
+        G.state = "";
+        G.mode = "";
+        G.fired = false;
+        G.drag = false;
+        G.lpFired = false;
+        clearTimeout(G.lpT);
+        G.sepPrev = null;
+        G.scPrev = null;
+        G.vx = G.vy = 0;
+        G.vt = 0;
+      }
+      function abortInput() {
+        // never leave the Mac's button held
+        clearInterval(scMom);
+        clearTimeout(G.lpT);
+        if (G.drag) {
+          G.drag = false;
+          inp({ t: "up" });
+        }
+        gReset();
+      }
+      addEventListener("touchcancel", abortInput);
+      addEventListener("blur", abortInput);
+      addEventListener("pagehide", abortInput);
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) abortInput();
+      });
+      document.addEventListener("fullscreenchange", () => {
+        if (!document.fullscreenElement) abortInput();
+      });
+      addEventListener(
+        "touchstart",
+        (e) => {
+          lastTouch = Date.now();
+          clearInterval(scMom); // touching stops any glide
+          if (drOpen && !uiEl(e.target)) {
+            openDr(false);
+            return;
+          } // tap outside closes it, swallows the tap
+          if (uiEl(e.target)) return; // drawer/tab never click the Mac
+          if (!inpOn()) return;
+          const T = e.touches,
+            n = T.length;
+          if (n === 1) {
+            const p = normXY(T[0].clientX, T[0].clientY);
+            if (!p) return;
+            G.rx = T[0].clientX;
+            G.ry = T[0].clientY; // raw px for the ripple
+            // multi-tap chain: this touch continues a recent tap at the same spot
+            if (
+              chainN &&
+              chainN < 3 &&
+              Date.now() - chainT < 320 &&
+              chainPt &&
+              Math.abs(p[0] - chainPt[0]) + Math.abs(p[1] - chainPt[1]) < 0.06
+            )
+              chainN++;
+            else chainN = 1;
+            gReset();
+            G.state = "touch";
+            G.t0 = Date.now();
+            G.start = p;
+            G.lpT = setTimeout(() => {
+              if (G.state === "touch" && !G.drag) {
+                G.lpFired = true;
+                chainN = 0;
+                ripple(G.rx, G.ry);
+                inp({ t: "rclick", x: G.start[0], y: G.start[1] });
+              }
+            }, 480);
+          } else {
+            // extra fingers: upgrade gesture
+            clearTimeout(G.lpT);
+            if (G.drag) inp({ t: "up" });
+            G.drag = false;
+            const prev = G.state; // mid-gesture upgrades never count as taps
+            const p = pos(T);
+            G.state = n === 2 ? "two" : "multi";
+            G.t0 = Date.now();
+            G.mode = "";
+            G.fired = prev !== "";
+            G.cx0 = p[0];
+            G.cy0 = p[1];
+            G.scPrev = null;
+            G.sepPrev = null;
+            if (n === 2)
+              G.sep0 = Math.hypot(T[0].clientX - T[1].clientX, T[0].clientY - T[1].clientY);
+            const q = normXY(p[0], p[1]);
+            if (q) G.start = q;
+          }
+        },
+        { passive: false },
+      );
+      addEventListener(
+        "touchmove",
+        (e) => {
+          lastTouch = Date.now(); // long gestures keep synthetic-mouse suppression armed
+          if (drOpen || uiEl(e.target)) return; // drawer open: let it scroll natively
+          if (!inpOn()) return;
+          e.preventDefault();
+          const T = e.touches,
+            n = T.length;
+          if (n === 1 && G.state === "touch") {
+            const p = normXY(T[0].clientX, T[0].clientY);
+            if (!p) return;
+            const d = Math.abs(p[0] - G.start[0]) + Math.abs(p[1] - G.start[1]);
+            if (G.drag) {
+              if (Date.now() - mvT > 30) {
+                mvT = Date.now();
+                inp({ t: "move", x: p[0], y: p[1] });
+              }
+            } else if (!G.lpFired && d > 0.012) {
+              // deliberate move -> drag
+              clearTimeout(G.lpT);
+              const c = chainN > 1 ? 2 : 1; // double-tap-drag = word select
+              chainN = 0;
+              G.drag = true;
+              mvT = Date.now();
+              inp({ t: "down", x: G.start[0], y: G.start[1], c: c });
+              inp({ t: "move", x: p[0], y: p[1] });
+            }
+            return;
+          }
+          if (n === 2 && G.state === "two") {
+            const c = pos(T),
+              sep = Math.hypot(T[0].clientX - T[1].clientX, T[0].clientY - T[1].clientY);
+            const now = Date.now();
+            const q = normXY(c[0], c[1]);
+            if (q) {
+              G.sx = q[0];
+              G.sy = q[1];
+            } // gesture position
+            if (!G.mode) {
+              // classify with hysteresis
+              if (Math.abs(sep - G.sep0) > 28) G.mode = "pinch";
+              else if (Math.hypot(c[0] - G.cx0, c[1] - G.cy0) > 10) G.mode = "scroll";
+              else return;
+            }
+            if (G.mode === "pinch") {
+              if (now - mvT > 40) {
+                const dz = sep - (G.sepPrev != null ? G.sepPrev : G.sep0);
+                G.sepPrev = sep;
+                mvT = now;
+                inp({ t: "scroll", zoom: 1, dy: dz * 2, x: G.sx, y: G.sy });
+              }
+            } else {
+              // scroll: accelerated, ordered, positioned
+              if (!G.scPrev) {
+                G.scPrev = c;
+                G.scT = now;
+                G.vx = G.vy = 0;
+                return;
+              }
+              if (now - G.scT >= 40) {
+                const dx = c[0] - G.scPrev[0],
+                  dy = c[1] - G.scPrev[1]; // sign: content follows fingers
+                G.vx = dx / (now - G.scT);
+                G.vy = dy / (now - G.scT);
+                G.vt = now; // px/ms, seeds the glide
+                scPost(dx, dy, [G.sx, G.sy]);
+                G.scT = now;
+                G.scPrev = c;
+              }
+            }
+            return;
+          }
+          // NOTE: no 3/4-finger SWIPE mappings — iPadOS claims those gestures first
+          // (3-finger swipe = screenshot / undo, 4/5-finger = multitasking) and the
+          // browser never sees them. Quick multi-finger TAPS are not claimed -> kept
+          // below as middle click.
+        },
+        { passive: false },
+      );
+      addEventListener(
+        "touchend",
+        (e) => {
+          lastTouch = Date.now();
+          if (!armed && !G.drag) return; // still finish a drag after losing fullscreen
+          clearTimeout(G.lpT);
+          if (e.touches.length) return; // fingers remain: gesture continues
+          const dt = Date.now() - G.t0;
+          if (G.drag) inp({ t: "up" });
+          else if (G.state === "two" && !G.mode && !G.fired && dt < 300) {
+            ripple(G.rx, G.ry);
+            inp({ t: "rclick", x: G.start[0], y: G.start[1] });
+          } else if (G.state === "multi" && !G.fired && dt < 300) {
+            ripple(G.rx, G.ry);
+            inp({ t: "mclick", x: G.start[0], y: G.start[1] });
+          } else if (G.state === "touch" && !G.lpFired) {
+            chainT = Date.now();
+            chainPt = G.start; // remember for the chain window
+            ripple(G.rx, G.ry);
+            inp({ t: "tap", x: G.start[0], y: G.start[1], c: Math.min(chainN, 3) });
+          } else if (
+            G.state === "two" &&
+            G.mode === "scroll" &&
+            (G.vx || G.vy) &&
+            Date.now() - G.vt < 140
+          ) {
+            // fresh flick -> glide
+            let vx = G.vx,
+              vy = G.vy;
+            clearInterval(scMom);
+            scMom = setInterval(() => {
+              if (!inpOn()) {
+                clearInterval(scMom);
+                return;
+              }
+              vx *= 0.9;
+              vy *= 0.9;
+              if (Math.hypot(vx, vy) < 0.015) {
+                clearInterval(scMom);
+                return;
+              }
+              scPost(vx * 40, vy * 40, [G.sx, G.sy]);
+            }, 40);
+          }
+          gReset();
+        },
+        { passive: false },
+      );
+      // mouse + wheel: a laptop browser drives the Mac too (hover, drag, wheel;
+      // ctrl+wheel = trackpad pinch -> Mac zoom). dblclick = double-click on the
+      // Mac AND toggles the stats overlay (plain taps click the Mac now).
+      // lastTouch (real touches only) swallows Safari's synthetic mouse events.
+      addEventListener("mousedown", (e) => {
+        if (!inpOn() || Date.now() - lastTouch < 800 || e.button !== 0) return;
+        if (drOpen && !uiEl(e.target)) {
+          openDr(false);
+          return;
+        }
+        if (uiEl(e.target)) return;
+        const p = normXY(e.clientX, e.clientY);
+        if (!p) return;
+        G.drag = true;
+        inp({ t: "down", x: p[0], y: p[1], c: Math.max(1, Math.min(3, e.detail || 1)) });
+      });
+      addEventListener("mousemove", (e) => {
+        if (!inpOn() || Date.now() - lastTouch < 800 || Date.now() - mvT <= 30) return;
+        mvT = Date.now();
+        const p = normXY(e.clientX, e.clientY);
+        if (p) inp({ t: "move", x: p[0], y: p[1] });
+      });
+      addEventListener("mouseup", () => {
+        if (G.drag) {
+          G.drag = false;
+          inp({ t: "up" });
+        }
+      });
+      addEventListener("dblclick", (e) => {
+        if (!inpOn() || Date.now() - lastTouch < 800) return;
+        openDr(!drOpen);
+      });
+      addEventListener(
+        "wheel",
+        (e) => {
+          if (!inpOn() || Date.now() - lastTouch < 800) return;
+          const p = normXY(e.clientX, e.clientY) || [0.5, 0.5];
+          if (e.ctrlKey)
+            inp({ t: "scroll", zoom: 1, dy: -e.deltaY, x: p[0], y: p[1] }); // trackpad pinch
+          else inp({ t: "scroll", dx: -e.deltaX, dy: -e.deltaY, x: p[0], y: p[1] });
+        },
+        { passive: true },
+      );
+      // ---- side drawer: stats + input control. Nothing floats over the picture:
+      // a small ⓘ tab on the right edge summons it; it slides away when done.
+      // The input control obeys the backend: it can only flip what the server
+      // allows (input_wanted + input_trusted from /status).
+      const dr = document.createElement("div");
+      dr.id = "dr";
+      dr.innerHTML =
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">' +
+        '<b>HoppScreen</b><button id=drx style="background:none;border:none;color:#999;font:20px system-ui;padding:2px 8px">\u2715</button></div>';
+      document.body.appendChild(dr);
+      dr.appendChild(st); // the stats block lives in here now
+      const tab = document.createElement("div");
+      tab.id = "tab";
+      tab.textContent = "\u24d8";
+      document.body.appendChild(tab);
+      setTimeout(() => tab.classList.add("dim"), 4000); // fades to a whisper after settling in
+      let drOpen = false;
+      function openDr(v) {
+        drOpen = !!v;
+        dr.classList.toggle("on", drOpen);
+      }
+      tab.addEventListener("click", (e) => {
+        e.stopPropagation();
+        tab.classList.remove("dim");
+        openDr(!drOpen);
+      });
+      tab.addEventListener(
+        "touchend",
+        (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          tab.classList.remove("dim");
+          openDr(!drOpen);
+        },
+        { passive: false },
+      );
+      dr.querySelector("#drx").addEventListener("click", (e) => {
+        e.stopPropagation();
+        openDr(false);
+      });
+      function uiEl(t) {
+        return !!(t && t.closest && t.closest("#dr,#tab"));
+      }
+      // input control: shown once /status says whether the backend permits input
+      let inputAllowed = null,
+        inputWhy = "";
+      const inSec = document.createElement("div");
+      inSec.style.cssText = "margin-top:16px";
+      const inHdr = document.createElement("div");
+      inHdr.textContent = "Input";
+      inHdr.style.cssText = "font-weight:600;margin-bottom:6px;color:#eee";
+      const btnIn = document.createElement("button");
+      btnIn.style.cssText =
+        "width:100%;padding:10px;margin-top:2px;border-radius:8px;border:1px solid rgba(255,255,255,.35);background:rgba(0,0,0,.6);color:#fff;font:14px system-ui";
+      const inWhy = document.createElement("div");
+      inWhy.style.cssText = "font:12px system-ui;color:#999;margin-top:6px;line-height:1.4";
+      inSec.appendChild(inHdr);
+      inSec.appendChild(btnIn);
+      inSec.appendChild(inWhy);
+      inSec.style.display = "none";
+      dr.appendChild(inSec);
+      function updInput() {
+        if (inputAllowed === null) {
+          inSec.style.display = "none";
+          return;
+        }
+        inSec.style.display = "block";
+        if (!inputAllowed) {
+          btnIn.disabled = true;
+          btnIn.style.opacity = 0.55;
+          btnIn.textContent = "\uD83D\uDD12 Input unavailable";
+          inWhy.textContent = inputWhy;
+          return;
+        }
+        btnIn.disabled = false;
+        btnIn.style.opacity = 1;
+        btnIn.textContent =
+          inputOn === false
+            ? "\uD83D\uDD12 View-only — tap to control"
+            : "\uD83D\uDC58 Controlling the Mac — tap for view-only";
+        inWhy.textContent =
+          inputOn === false
+            ? "input is disabled; touches do nothing"
+            : "your touches click the Mac";
+      }
+      function toggleInp() {
+        if (inputAllowed !== true) return;
+        fetch("/input/toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        })
+          .then((r) => r.text())
+          .then((t) => {
+            inputOn = t === "on";
+            updInput();
+          })
+          .catch(() => {});
+      }
+      btnIn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleInp();
+      });
+      btnIn.addEventListener(
+        "touchend",
+        (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          toggleInp();
+        },
+        { passive: false },
+      );
+      async function startH264() {
+        const res = await fetch("/h264", { cache: "no-store" });
+        if (res.status === 401) {
+          location.reload();
+          throw new Error("401");
+        } // login lost: 401 on / re-prompts
+        if (!res.ok || !res.body) throw new Error("no h264");
+        await clockSync().catch(() => {});
+        const rd = res.body.getReader();
+        const buf = new Buf();
+        let cfg = null,
+          dec = null,
+          g = null,
+          bad = false;
+        try {
+          while (alive && !bad) {
+            const { done, value } = await rd.read();
+            if (done) break;
+            buf.push(value);
+            if (!cfg) {
+              if (buf.have() < 4) continue;
+              const L = buf.u32(0);
+              if (buf.have() < 4 + L) continue;
+              buf.take(4);
+              cfg = JSON.parse(new TextDecoder().decode(buf.take(L)));
+              if (cv.width !== cfg.w || cv.height !== cfg.h) {
+                cv.width = cfg.w;
+                cv.height = cfg.h;
+              }
+              g = cv.getContext("2d", { alpha: false, desynchronized: true });
+              dec = new VideoDecoder({
+                output: (f) => {
+                  g.drawImage(f, 0, 0, cv.width, cv.height);
+                  if (rep.delete(f.timestamp)) {
+                  } else {
+                    finalLat = srvNow() - f.timestamp / 1000;
+                    latS.push(finalLat);
+                  }
+                  f.close();
+                  tick();
+                  latTick(dec.decodeQueueSize);
+                },
+                error: (e) => {
+                  console.warn(e);
+                  bad = true;
+                  report("&err=" + encodeURIComponent("decoder: " + e.message));
+                },
+              });
+              const c = {
+                codec: cfg.codec,
+                description: b64u8(cfg.desc),
+                optimizeForLatency: true,
+                hardwareAcceleration: "prefer-hardware",
+              };
+              try {
+                if (!(await VideoDecoder.isConfigSupported(c)).supported)
+                  delete c.hardwareAcceleration;
+              } catch (e) {
+                delete c.hardwareAcceleration;
+              }
+              dec.configure(c);
+              cv.style.display = "block";
+              img.style.display = "none";
+              cvInfo = info = cfg.w + "x" + cfg.h + " " + cfg.codec + (cfg.arate ? " +audio" : "");
+              report();
+              if (cfg.arate) audioInit(cfg.arate);
+            }
+            while (buf.have() >= 13) {
+              const L = buf.u32(0);
+              if (buf.have() < 13 + L) break;
+              const fl = buf.b[buf.o + 4],
+                ts = buf.u32(5) * 4294967296 + buf.u32(9);
+              buf.take(13);
+              const data = buf.take(L);
+              if (fl & 4) {
+                if (L > 3) audioFeed(new Int16Array(data.buffer, data.byteOffset, L >> 1));
+                continue;
+              }
+              if (fl & 2) rep.add(ts);
+              else latA.push(srvNow() - ts / 1000);
+              if (L > 0 && dec.state === "configured")
+                dec.decode(
+                  new EncodedVideoChunk({ type: fl & 1 ? "key" : "delta", timestamp: ts, data }),
+                );
+            }
+          }
+        } finally {
+          try {
+            rd.cancel();
+          } catch (e) {}
+          try {
+            if (dec && dec.state !== "closed") dec.close();
+          } catch (e) {}
+        }
+      }
+      function startMjpeg() {
+        mode = "mjpeg";
+        report();
+        img.style.display = "block";
+        cv.style.display = "none";
+        img.onerror = () => {
+          if (alive)
+            setTimeout(() => {
+              img.src = "/stream.mjpg?t=" + Date.now();
+            }, 900);
+        };
+        img.onload = () => tick();
+        img.src = "/stream.mjpg?t=" + Date.now();
+      }
+      async function fit() {
+        try {
+          const s = await (await fetch("/status", { cache: "no-store" })).json();
+          if ("input" in s) {
+            inputOn = !!s.input;
+            inputAllowed = s.input_wanted !== false && s.input_trusted !== false;
+            inputWhy =
+              s.input_wanted === false
+                ? "the Mac is running view-only (started with INPUT=0)"
+                : "allow hoppscreen on the Mac: System Settings > Privacy & Security > Accessibility";
+            updInput();
+          }
+          const W = Math.round(screen.width * devicePixelRatio),
+            H = Math.round(screen.height * devicePixelRatio);
+          if (!W || !H || W < 500 || H < 500) return;
+          if (Math.abs(W - s.pixel_width) <= W / 8 && Math.abs(H - s.pixel_height) <= H / 8) return;
+          let hz = 0;
+          const d = [];
+          let n = 0;
+          await new Promise((r) =>
+            requestAnimationFrame(function f(t) {
+              d.push(t);
+              if (++n >= 24) r();
+              else requestAnimationFrame(f);
+            }),
+          );
+          if (d.length > 5) {
+            const dt = d[d.length - 1] - d[0];
+            if (dt > 0) hz = Math.round((1000 * (d.length - 1)) / dt);
+          }
+          await fetch("/fit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store",
+            body: JSON.stringify({ w: W, h: H, dpr: devicePixelRatio, hz: hz || 60 }),
+          });
+        } catch (e) {}
+      }
+      async function start() {
+        alive = true;
+        st.style.display = "block";
+        fit();
+        if (WC) {
+          mode = "h264";
+          while (alive) {
+            try {
+              await startH264();
+            } catch (e) {
+              console.warn(e);
+              report("&err=" + encodeURIComponent(String((e && e.message) || e)));
+            }
+            if (!alive) break;
+            await new Promise((r) => setTimeout(r, 500));
+          }
+        } else startMjpeg();
+      }
+      const wv = $("w");
+      function keepAwake() {
+        if (wv.paused) wv.play().catch(() => {});
+        try {
+          navigator.wakeLock && navigator.wakeLock.request("screen").catch(() => {});
+        } catch (e) {}
+      }
+      let fsBroken = false;
+      async function goFull() {
+        try {
+          if (!document.fullscreenElement)
+            await document.documentElement.requestFullscreen({ navigationUI: "hide" });
+        } catch (e) {
+          fsBroken = true;
+        }
+        try {
+          await screen.orientation.lock("landscape");
+        } catch (e) {}
+      }
+      // stream starts immediately (decoder warm before the tap); fullscreen needs a user gesture
+      start();
+      let armed = false;
+      document.addEventListener("click", async (e) => {
+        if (uiEl(e.target)) return;
+        if (drOpen) {
+          openDr(false);
+          return;
+        }
+        if (!armed) {
+          armed = true;
+          ui.remove();
+          await goFull();
+          if (aCtx && aCtx.state !== "running") aCtx.resume().catch(() => {});
+          wv.src = "/silent.mp4";
+          wv.volume = 0;
+          await wv.play().catch(() => {});
+          keepAwake();
+          setInterval(keepAwake, 5000);
+          setTimeout(fit, 1200); // re-fit after orientation settles
+          return;
+        }
+        if (!document.fullscreenElement) {
+          goFull();
+          return;
+        } // left fullscreen: any tap restores it
+        if (Date.now() - lastTouch < 800 || Date.now() - lastInp < 800) return; // input already acted
+        openDr(!drOpen); // plain click (no input action): drawer
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) keepAwake();
+      });
+    </script>
+  </body>
+</html>

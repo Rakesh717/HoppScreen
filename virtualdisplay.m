@@ -48,7 +48,7 @@
 // --------------------------------------------------------------------------
 
 @implementation VirtualDisplay {
-    CGVirtualDisplay *_display;   // strong: owns the live display
+    CGVirtualDisplay *_display; // strong: owns the live display
     dispatch_queue_t _queue;
 }
 
@@ -59,12 +59,13 @@
                  hiDPI:(BOOL)hiDPI
            refreshRate:(double)refreshRate
                  error:(NSString *_Nullable *_Nullable)error {
-    Class DescCls     = NSClassFromString(@"CGVirtualDisplayDescriptor");
+    Class DescCls = NSClassFromString(@"CGVirtualDisplayDescriptor");
     Class SettingsCls = NSClassFromString(@"CGVirtualDisplaySettings");
-    Class ModeCls     = NSClassFromString(@"CGVirtualDisplayMode");
-    Class DisplayCls  = NSClassFromString(@"CGVirtualDisplay");
+    Class ModeCls = NSClassFromString(@"CGVirtualDisplayMode");
+    Class DisplayCls = NSClassFromString(@"CGVirtualDisplay");
     if (!DescCls || !SettingsCls || !ModeCls || !DisplayCls) {
-        if (error) *error = @"CGVirtualDisplay private API unavailable on this macOS build.";
+        if (error)
+            *error = @"CGVirtualDisplay private API unavailable on this macOS build.";
         return NO;
     }
 
@@ -78,7 +79,8 @@
     // name shown in macOS display settings; override with HOPPSCREEN_NAME=<str>
     NSString *dispName = @"HoppScreen Display";
     const char *envName = getenv("HOPPSCREEN_NAME");
-    if (envName && envName[0]) dispName = [NSString stringWithUTF8String:envName];
+    if (envName && envName[0])
+        dispName = [NSString stringWithUTF8String:envName];
     desc.name = dispName;
     desc.vendorID = 0x1234;
     desc.productID = 0x1620;
@@ -89,35 +91,40 @@
     desc.sizeInMillimeters = CGSizeMake(237, 148);
     desc.maxPixelsWide = pw;
     desc.maxPixelsHigh = ph;
-    desc.redPrimary   = CGPointMake(0.640, 0.330);
+    desc.redPrimary = CGPointMake(0.640, 0.330);
     desc.greenPrimary = CGPointMake(0.300, 0.600);
-    desc.bluePrimary  = CGPointMake(0.150, 0.060);
-    desc.whitePoint   = CGPointMake(0.3127, 0.3290);
+    desc.bluePrimary = CGPointMake(0.150, 0.060);
+    desc.whitePoint = CGPointMake(0.3127, 0.3290);
 
     // creation fails while a previous instance with the same serial is still being
     // torn down (e.g. right after a restart) — retry, then fall back to a random serial
     CGVirtualDisplay *display = nil;
     for (int attempt = 0; attempt < 6 && !display; attempt++) {
-        if (attempt == 5) desc.serialNum = arc4random();
+        if (attempt == 5)
+            desc.serialNum = arc4random();
         display = [[DisplayCls alloc] initWithDescriptor:desc];
-        if (!display && attempt < 5) usleep(500000);
+        if (!display && attempt < 5)
+            usleep(500000);
     }
     if (!display) {
-        if (error) *error = @"Failed to create CGVirtualDisplay.";
+        if (error)
+            *error = @"Failed to create CGVirtualDisplay.";
         return NO;
     }
 
     // Mode is given in POINTS; with hiDPI=1 macOS additionally synthesizes a 2x-backed
     // variant (points x2 pixels). It isn't the default, so we select it below.
-    CGVirtualDisplayMode *mode =
-        [[ModeCls alloc] initWithWidth:width height:height refreshRate:refreshRate];
+    CGVirtualDisplayMode *mode = [[ModeCls alloc] initWithWidth:width
+                                                         height:height
+                                                    refreshRate:refreshRate];
     CGVirtualDisplaySettings *settings = [[SettingsCls alloc] init];
-    settings.modes = @[mode];
+    settings.modes = @[ mode ];
     settings.hiDPI = hiDPI ? 1 : 0;
     settings.rotation = 0;
 
     if (![display applySettings:settings]) {
-        if (error) *error = @"applySettings failed.";
+        if (error)
+            *error = @"applySettings failed.";
         return NO;
     }
 
@@ -126,22 +133,27 @@
 
     // displayID and the mode catalog land asynchronously after applySettings:
     // poll until assigned, then force the exact (points, pixels) mode.
-    NSDictionary *modeOpts = @{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES};
+    NSDictionary *modeOpts =
+        @{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes : @YES};
     BOOL ok = NO;
     for (int attempt = 0; attempt < 60 && !ok; attempt++) {
         usleep(150000);
 
-        if (_displayID == 0) _displayID = display.displayID;
-        if (_displayID == 0) continue;  // not assigned yet
+        if (_displayID == 0)
+            _displayID = display.displayID;
+        if (_displayID == 0)
+            continue; // not assigned yet
 
-        CFArrayRef modes = CGDisplayCopyAllDisplayModes(_displayID, (__bridge CFDictionaryRef)modeOpts);
+        CFArrayRef modes =
+            CGDisplayCopyAllDisplayModes(_displayID, (__bridge CFDictionaryRef)modeOpts);
         if (modes) {
             CGDisplayModeRef target = NULL;
             for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
                 CGDisplayModeRef mm = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
                 if (CGDisplayModeGetWidth(mm) == width && CGDisplayModeGetHeight(mm) == height &&
                     CGDisplayModeGetPixelWidth(mm) == pw && CGDisplayModeGetPixelHeight(mm) == ph) {
-                    target = mm; break;
+                    target = mm;
+                    break;
                 }
             }
             if (target) {
@@ -154,39 +166,49 @@
             CFRelease(modes);
         }
 
-        ok = (self.servedWidth == width && self.servedHeight == height &&
-              self.pixelWidth == pw && self.pixelHeight == ph);
+        ok = (self.servedWidth == width && self.servedHeight == height && self.pixelWidth == pw &&
+              self.pixelHeight == ph);
     }
 
     if (!ok) {
-        if (error) *error = [NSString stringWithFormat:@"display settled at %ux%u pt (%ux%u px), not %ux%u pt (%ux%u px)",
-                             self.servedWidth, self.servedHeight, self.pixelWidth, self.pixelHeight,
-                             width, height, pw, ph];
+        if (error)
+            *error = [NSString
+                stringWithFormat:@"display settled at %ux%u pt (%ux%u px), not %ux%u pt (%ux%u px)",
+                                 self.servedWidth, self.servedHeight, self.pixelWidth,
+                                 self.pixelHeight, width, height, pw, ph];
         return NO;
     }
     return YES;
 }
 
-- (uint32_t)servedWidth  { return _displayID ? (uint32_t)CGDisplayPixelsWide(_displayID) : 0; }
-- (uint32_t)servedHeight { return _displayID ? (uint32_t)CGDisplayPixelsHigh(_displayID) : 0; }
+- (uint32_t)servedWidth {
+    return _displayID ? (uint32_t)CGDisplayPixelsWide(_displayID) : 0;
+}
+- (uint32_t)servedHeight {
+    return _displayID ? (uint32_t)CGDisplayPixelsHigh(_displayID) : 0;
+}
 
 - (uint32_t)pixelWidth {
-    if (!_displayID) return 0;
+    if (!_displayID)
+        return 0;
     CGDisplayModeRef m = CGDisplayCopyDisplayMode(_displayID);
     uint32_t v = m ? (uint32_t)CGDisplayModeGetPixelWidth(m) : 0;
-    if (m) CGDisplayModeRelease(m);
+    if (m)
+        CGDisplayModeRelease(m);
     return v;
 }
 - (uint32_t)pixelHeight {
-    if (!_displayID) return 0;
+    if (!_displayID)
+        return 0;
     CGDisplayModeRef m = CGDisplayCopyDisplayMode(_displayID);
     uint32_t v = m ? (uint32_t)CGDisplayModeGetPixelHeight(m) : 0;
-    if (m) CGDisplayModeRelease(m);
+    if (m)
+        CGDisplayModeRelease(m);
     return v;
 }
 
 - (void)stop {
-    _display = nil;   // releasing the owner tears down the virtual display
+    _display = nil; // releasing the owner tears down the virtual display
     _displayID = 0;
     _queue = nil;
 }

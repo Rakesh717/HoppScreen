@@ -11,15 +11,15 @@ NS_ASSUME_NONNULL_BEGIN
 @interface VirtualDisplay : NSObject
 
 /// CGDirectDisplayID of the live virtual display, or 0 if not started.
-@property (nonatomic, readonly) uint32_t displayID;
+@property(nonatomic, readonly) uint32_t displayID;
 
 /// Logical size in points ("looks like" size in System Settings).
-@property (nonatomic, readonly) uint32_t servedWidth;
-@property (nonatomic, readonly) uint32_t servedHeight;
+@property(nonatomic, readonly) uint32_t servedWidth;
+@property(nonatomic, readonly) uint32_t servedHeight;
 
 /// Backing framebuffer size in pixels (= points * scale). This is what gets captured.
-@property (nonatomic, readonly) uint32_t pixelWidth;
-@property (nonatomic, readonly) uint32_t pixelHeight;
+@property(nonatomic, readonly) uint32_t pixelWidth;
+@property(nonatomic, readonly) uint32_t pixelHeight;
 
 /// Create the virtual display. width/height are in POINTS; with hiDPI the
 /// framebuffer is 2x in each dimension (Retina-sharp text).
