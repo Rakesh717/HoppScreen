@@ -1,7 +1,7 @@
 # HoppScreen — build & service control (the single entry point)
 #   make run      build if needed, then run in the FOREGROUND (ctrl-c stops)
 #   make start    build if needed, then run in the background (log: server.log)
-#   make stop | restart | status | log | build | help
+#   make stop | restart | status | log | build | format | format-check | clean | help
 # The background server writes to server.log and its pid to server.pid.
 # Run make from this directory.
 
@@ -30,7 +30,20 @@ INPUT   ?= 0
 export HOPPSCREEN_INPUT = $(INPUT)
 
 .DEFAULT_GOAL := help
-.PHONY: help run start stop restart status log build clean
+.PHONY: help run start stop restart status log build format format-check clean
+
+# formatters: .clang-format for C/ObjC (falls back to Xcode's toolchain copy),
+# prettier for the receiver page. format-check fails if anything is unformatted.
+CLANG_FORMAT ?= $(shell command -v clang-format 2>/dev/null || echo "xcrun clang-format")
+PRETTIER ?= npx --yes prettier
+
+format:
+	$(CLANG_FORMAT) -i server.m virtualdisplay.m virtualdisplay.h keeper.m bench2.m
+	$(PRETTIER) --write --print-width 100 web/index.html
+
+format-check:
+	@$(CLANG_FORMAT) --dry-run --Werror server.m virtualdisplay.m virtualdisplay.h keeper.m bench2.m
+	@$(PRETTIER) --check --print-width 100 web/index.html
 
 help:
 	@echo "HoppScreen — make <target>"
@@ -41,10 +54,11 @@ help:
 	@echo "  status     running? pid, uptime, /status json, recent log"
 	@echo "  log        follow the server log (ctrl-c to leave)"
 	@echo "  build      compile only (run/start do this automatically)"
+	@echo "  format     reformat C sources (clang-format) + web/index.html (prettier)"
+	@echo "  format-check  fail instead of fix — for CI / pre-commit"
 	@echo "  clean      remove the server binary and generated web header"
 	@echo "  vars:      ARGS=\"1680 1050\" pins the display size  AUDIO=1 adds sound  INPUT=1 allows touch control  PORT=8080 (probe)  MBPS=6 caps bitrate (slow Wi-Fi)"
 
-# staleness (missing binary / newer sources) is make's own dependency check
 # Embed the receiver at build time; the installed binary needs no web directory.
 # xxd names the array web_index_html and provides web_index_html_len (no NUL).
 web_index.h: web/index.html
