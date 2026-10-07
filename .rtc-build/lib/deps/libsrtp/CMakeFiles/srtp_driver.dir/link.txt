@@ -1,1 +1,0 @@
-/usr/bin/cc -O3 -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/srtp_driver.dir/test/srtp_driver.c.o CMakeFiles/srtp_driver.dir/test/util.c.o CMakeFiles/srtp_driver.dir/test/getopt_s.c.o -o srtp_driver  libsrtp2.a /opt/homebrew/opt/openssl@3/lib/libcrypto.dylib
