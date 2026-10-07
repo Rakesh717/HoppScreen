@@ -1,0 +1,9 @@
+[submodule "vendor/FreelyDisplay"]
+	path = vendor/FreelyDisplay
+	url = https://github.com/guoPhineas/FreelyDisplay
+[submodule "vendor/macos-virtual-display-vnc"]
+	path = vendor/macos-virtual-display-vnc
+	url = https://github.com/Fallstop/macos-virtual-display-vnc
+[submodule "vendor/oldmac-display"]
+	path = vendor/oldmac-display
+	url = https://github.com/crazyathlete220-stack/oldmac-display
