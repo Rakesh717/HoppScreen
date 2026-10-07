@@ -27,5 +27,9 @@ venv/
 .DS_Store
 attic/
 hoppscreen-rtc
+<<<<<<< HEAD
 rtc_web.h
 .rtc-build/
+=======
+vendor/libdatachannel/
+>>>>>>> main
