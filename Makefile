@@ -31,6 +31,20 @@ export HOPPSCREEN_INPUT = $(INPUT)
 
 .DEFAULT_GOAL := help
 .PHONY: help run start stop restart status log build format format-check clean
+.PHONY: rtc rtc-deps
+
+# Prototype only: no dependency or link changes to the shipped target.
+RTC_BUILD := .rtc-build
+OPENSSL_ROOT := $(shell brew --prefix openssl@3 2>/dev/null)
+rtc-deps:
+	@command -v cmake >/dev/null || { echo 'Install prerequisites: brew install cmake openssl@3'; exit 1; }
+	@test -n "$(OPENSSL_ROOT)" || { echo 'Install prerequisites: brew install openssl@3'; exit 1; }
+	git submodule update --init --recursive vendor/libdatachannel
+	cmake -S vendor/libdatachannel -B $(RTC_BUILD)/lib -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR=$(OPENSSL_ROOT) -DNO_EXAMPLES=ON -DNO_TESTS=ON -DNO_WEBSOCKET=ON -DNO_LIBNICE=ON -DBUILD_SHARED_LIBS=OFF
+	cmake --build $(RTC_BUILD)/lib -j 8
+
+$(RTC_BUILD)/lib/libdatachannel.a:
+	$(MAKE) rtc-deps
 
 # formatters: .clang-format for C/ObjC (falls back to Xcode's toolchain copy),
 # prettier for the receiver page. format-check fails if anything is unformatted.

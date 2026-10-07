@@ -7,3 +7,6 @@
 [submodule "vendor/oldmac-display"]
 	path = vendor/oldmac-display
 	url = https://github.com/crazyathlete220-stack/oldmac-display
+[submodule "vendor/libdatachannel"]
+	path = vendor/libdatachannel
+	url = https://github.com/paullouisageneau/libdatachannel

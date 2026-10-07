@@ -26,3 +26,6 @@ venv/
 # macOS
 .DS_Store
 attic/
+hoppscreen-rtc
+rtc_web.h
+.rtc-build/
