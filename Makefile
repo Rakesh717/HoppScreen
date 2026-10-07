@@ -18,6 +18,10 @@ ARGS    ?=
 # audio: 1 = stream the Mac's system sound with the video, 0 = silent (default)
 AUDIO   ?= 0
 export HOPPSCREEN_AUDIO = $(AUDIO)
+# h264 bitrate ceiling in Mbps (default: pixel-count formula, max 40). Lower it
+# on slow or shared Wi-Fi, e.g. make restart MBPS=6 ARGS="1200 750 8080 30"
+MBPS    ?=
+export HOPPSCREEN_MBPS = $(MBPS)
 # input: 0 = view-only by default — receiver touches never click the Mac.
 # INPUT=1 opts in at boot (needs the Accessibility permission, granted once);
 # when booted with INPUT=1 the page toggle can still flip view-only live,
@@ -38,7 +42,7 @@ help:
 	@echo "  log        follow the server log (ctrl-c to leave)"
 	@echo "  build      compile only (run/start do this automatically)"
 	@echo "  clean      remove the server binary and generated web header"
-	@echo "  vars:      ARGS=\"1680 1050\" pins the display size  AUDIO=1 adds sound  INPUT=1 allows touch control  PORT=8080 (probe)"
+	@echo "  vars:      ARGS=\"1680 1050\" pins the display size  AUDIO=1 adds sound  INPUT=1 allows touch control  PORT=8080 (probe)  MBPS=6 caps bitrate (slow Wi-Fi)"
 
 # staleness (missing binary / newer sources) is make's own dependency check
 # Embed the receiver at build time; the installed binary needs no web directory.

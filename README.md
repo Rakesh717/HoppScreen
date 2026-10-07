@@ -62,6 +62,19 @@ Pinned sizes: `ARGS="1680 1050"` gives more space but smaller, slightly softer
 text. `HOPPSCREEN_SCALE=1 ARGS="2880 1800"` uses a non-Retina 1x mode with tiny text.
 `ARGS="1440 900 8080 60"` for 60fps (less load, ~15ms more lag).
 
+### Congested Wi-Fi (office / shared APs)
+
+The encoder targets up to 40 Mbps — fine on home Wi-Fi, too much for a shared
+AP (constant backlog → resync stutter). Cap it and shed pixels:
+
+```bash
+make restart MBPS=6 ARGS="1200 750 8080 30"   # pad size, 30fps, 6 Mbps ceiling
+HOPPSCREEN_SCALE=1 make restart ARGS="1440 900 8080 30"  # 1x pixels: 4x less data
+```
+
+Keep `AUDIO=0` (raw PCM costs ~1.5 Mbps). Stream packets are DSCP AF41-marked,
+so APs that honor WMM queue them as video ahead of bulk traffic.
+
 ### Why HTTPS (port 8443)
 
 Chrome only allows its H.264 decoder (WebCodecs) on **secure** pages. Plain

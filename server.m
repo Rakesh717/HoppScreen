@@ -685,10 +685,17 @@ static BOOL startH264Encoder(void) {
     setNum(kVTCompressionPropertyKey_ExpectedFrameRate, g_fps);
     // bitrate scales with pixel count: ~28 Mbps for 2880x1800@60. Desktop content is
     // mostly static so the real average is far lower; the headroom keeps text crisp
-    // while scrolling.
+    // while scrolling. HOPPSCREEN_MBPS=<n> overrides the ceiling for slow or shared
+    // Wi-Fi; the floor follows so a tiny budget is honored instead of floored at 8.
+    double cap = 40e6, floorBps = 8e6;
+    const char *mb = getenv("HOPPSCREEN_MBPS");
+    if (mb) {
+        double v = atof(mb);
+        if (v > 0) { cap = v * 1e6; if (floorBps > cap) floorBps = cap; }
+    }
     double bps = (double)g_pixW * g_pixH * g_fps * 0.09;
-    if (bps < 8e6) bps = 8e6;
-    if (bps > 40e6) bps = 40e6;
+    if (bps < floorBps) bps = floorBps;
+    if (bps > cap) bps = cap;
     setNum(kVTCompressionPropertyKey_AverageBitRate, bps);
     // hard cap on bursts (bytes per 1s window) so one huge frame can't flood Wi-Fi
     {
@@ -2076,6 +2083,10 @@ static void *serverThread(void *arg) {
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));   // no Nagle: frames leave immediately
+        // DSCP AF41: congested/enterprise APs map this to the WMM video queue,
+        // so stream packets jump ahead of bulk traffic. No-op on APs that ignore DSCP.
+        int tos = 0x88 << 2;
+        setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
         fcntl(fd, F_SETFD, FD_CLOEXEC);                  // active streams must not survive a /fit re-exec
         struct timeval tv = {10, 0}, stv = {3, 0};
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
