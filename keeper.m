@@ -6,6 +6,7 @@
 // keeps recompositing it and push capture delivers at full rate.
 //
 // Usage: ./keeper <displayID>          (0 = rightmost display)
+// Standalone diagnostic utility; HoppScreen does not launch it automatically.
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
@@ -17,7 +18,7 @@
 @implementation KeeperApp
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     (void)n;
-    // resolve target display
+    // A zero target selects the display with the furthest-right edge.
     CGDirectDisplayID target = self.target;
     if (!target) {
         CGDirectDisplayID ids[16]; uint32_t count = 0;

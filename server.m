@@ -1,28 +1,49 @@
-// HoppScreen — wireless display extender server (macOS -> any browser)
-// Pure ObjC, no deps.
-//   - Virtual display via private CGVirtualDisplay ObjC API (proven on macOS 26)
-//   - Capture via CGDisplayCreateImage (dlsym; header-obsoleted but functional)
-//   - Encodes H.264 (VideoToolbox, hardware) and/or MJPEG
-//   - HTTP endpoints:
-//       /            -> player page (WebCodecs H.264, MJPEG fallback)
-//       /h264        -> [4B len][JSON cfg] then frames: [4B len][1B flags][AVCC AU]
-//       /stream.mjpg -> MJPEG multipart (fallback)
-//       /frame.jpg   -> single JPEG (debug)
-//       /status      -> JSON stats
-//       /input       -> POST touch events; replayed as clicks on the Mac
-//       /fit         -> auto-fit: client reports its panel; server re-execs with
-//                       a matching display size (see "auto-fit" section)
-//
-//   Every endpoint requires HTTP Basic auth (./passwd next to the binary, or
-//   HOPPSCREEN_PASSWORD=<pw> env; loopback (this Mac) is exempt).
-//
-//   clang -fobjc-arc -O2 -I. -framework Foundation -framework CoreGraphics \
-//       -framework AppKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
-//       server.m VirtualDisplay.m -o hoppscreen
-//
-// Usage: hoppscreen [width_pt height_pt [port [fps]]]
-//   No args -> 1440 900 8080 120 + AUTO-FIT ON (display matches the first client
-//   that opens the page). Explicit sizes pin the display and disable auto-fit.
+/*
+ * HoppScreen — macOS virtual display streamed directly to a browser.
+ * Private CGVirtualDisplay creates the desktop; capture tries ScreenCaptureKit,
+ * then CGDisplayStream, then CGDisplayCreateImage polling. VideoToolbox encodes
+ * hardware H.264; JPEG is the browser fallback. System audio requires SCK.
+ *
+ * Request routes (shared by HTTP and HTTPS):
+ *   /, /index.html  Embedded receiver: WebCodecs H.264 or MJPEG fallback.
+ *   /h264           [4B length][JSON config], then records described at writeRec.
+ *   /stream.mjpg    Multipart JPEG stream. /frame.jpg requests one fresh JPEG.
+ *   /status         JSON display, capture, stream and input state.
+ *   /time           Wall-clock microseconds for receiver clock synchronization.
+ *   /hello          Receiver diagnostics in the log; returns 204.
+ *   /ca.crt         Local CA download. /silent.mp4 serves the wake-lock loop.
+ *   /input          POST JSON gestures, replayed with Accessibility permission.
+ *   /input/toggle   POST JSON to toggle input; boot opt-in is still required.
+ *   /fit            POST JSON panel dimensions; may re-exec with a matching mode.
+ * All routes use Basic auth, except IPv4 loopback peers (127/8). Credentials
+ * come from passwd next to the binary (generated if absent), or the env below.
+ *
+ * Environment (HOPPSCREEN_ prefix on every name):
+ *   NAME           Nonempty display name; default "HoppScreen Display".
+ *   PORT           HTTP port fallback (1..65535); positional port wins.
+ *   FPS            FPS fallback (1..120); positional fps wins.
+ *   SCALE          atoi(value)==1 selects 1x; otherwise HiDPI 2x.
+ *   AUTOFIT        No size args: on unless 0; size args: on only if 1.
+ *   LASTFIT        Internal epoch-seconds timestamp carried across refit execs.
+ *   AUDIO          On unless atoi(value)==0; make defaults AUDIO=0.
+ *   INPUT          Off unless atoi(value)!=0; boot-disabled input stays view-only.
+ *   SCROLL_INVERT  Nonzero atoi(value) reverses wheel/zoom direction.
+ *   PASSWORD       Nonempty password overrides passwd; accepts any username.
+ *   TLS_PORT       HTTPS port; default HTTP+363; 0 disables HTTPS.
+ *   LOWLAT         Encoder low-latency mode on unless atoi(value)==0.
+ *   NOVUI          Presence disables low-delay SPS/VUI rewriting.
+ *   POLL           Presence skips push capture and starts polling directly.
+ *   KEEP_PUSH      Presence keeps the watchdog's CGDisplayStream fallback.
+ *   DEBUG          Presence enables additional capture/audio/TLS/cursor logs.
+ *
+ * Build: make build (Objective-C/C99, clang -fobjc-arc -O2; macOS frameworks).
+ * The Makefile embeds web/index.html via xxd; the receiver is self-contained.
+ * Run: make run (foreground), make start/stop/restart (background, server.log).
+ * Usage: hoppscreen [width_pt height_pt [port [fps]]]; defaults 1440 900 8080 120.
+ * No size args enables auto-fit; explicit sizes pin the mode unless overridden.
+ * make run/start prepares TLS via certs.sh. Screen Recording is needed for capture;
+ * Accessibility is needed only for input. Runtime assets resolve beside the binary.
+ */
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -50,14 +71,22 @@
 #include <limits.h>
 #import <mach-o/dyld.h>
 #import "virtualdisplay.h"
+#include "web_index.h"
 
 // ============================================================ shared state
+// Display geometry, capture snapshots and stream publications shared by workers.
+// g_lock guards published JPEG/AU/latest-buffer state; g_encQ serializes push submits.
+// State blocks below keep declaration/initialization order unchanged.
+
+// Lifecycle and display geometry (points versus encoded framebuffer pixels).
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_auCond = PTHREAD_COND_INITIALIZER;   // signalled on every new AU
 static volatile BOOL g_running = YES;
 static uint32_t g_displayID = 0, g_dispW = 0, g_dispH = 0;   // logical size (points)
 static uint32_t g_pixW = 0, g_pixH = 0;                       // framebuffer size (pixels) = what we encode
 static double g_fps = 60.0;
+
+// Encoder submission, refresh requests and client demand.
 static volatile int g_forceKey = 0;            // next encoded frame must be an IDR (new client / resync)
 static volatile uint64_t g_lastSubmitNs = 0;   // host time of the last frame handed to the encoder
 static volatile uint64_t g_lastRealNs = 0;     // last frame that came from capture (not a repeat)
@@ -72,6 +101,8 @@ static NSData *g_jpeg = nil;
 static uint64_t g_jpegSeq = 0;
 
 // H.264 ring of AVCC access units (+ audio records)
+// Writers publish under g_lock, then wake g_auCond; seq detects overwritten slots.
+// Audio advances seq but not vseq, so video lag and physical overflow are distinct.
 typedef struct {
     uint64_t seq;
     uint64_t vseq;         // video-only sequence (audio records carry the current one)
@@ -91,6 +122,8 @@ static volatile uint64_t g_encOutFrames = 0;   // AUs emitted by encoder callbac
 static volatile double g_encFps = 0;
 static uint64_t g_encFrames = 0;
 static volatile double g_captureFps = 0;
+
+// Capture/encoder resources and diagnostics; retained snapshots outlive callbacks.
 static VTCompressionSessionRef g_vts = NULL;
 static CVPixelBufferPoolRef g_pbPool = NULL;   // recycled BGRA buffers for encode input
 static uint64_t g_capFrames = 0;               // total capture frames
@@ -103,6 +136,8 @@ static CGImageRef g_jpegImg = NULL;              // latest frame for the jpeg th
 static double g_capMs = 0.0;                     // avg CGDisplayCreateImage ms
 static NSData *g_silentMp4 = nil;                // silent loop video (screen wakelock)
 static CGDisplayStreamRef g_cgStream = NULL;   // CGDisplayStream push capture (2nd try)
+
+// Compatibility ABI for the CoreGraphics push fallback.
 // CGDisplayStream API: obsoleted from macOS 15 headers but the push machinery
 // still exists in CoreGraphics — resolve dynamically and redeclare the ABI.
 static void processFrame(CVPixelBufferRef pb);
@@ -189,6 +224,8 @@ static NSData *copyJpeg(uint64_t *seqOut) {
 }
 
 // ============================================================ SPS VUI rewrite (decoder latency)
+// Rewrite only decoder buffering restrictions, preserving the remaining SPS bits.
+// Both avcC and in-band SPS use this path; HOPPSCREEN_NOVUI bypasses it.
 // VideoToolbox writes SPS with pic_order_cnt_type=0 and NO VUI bitstream_restriction.
 // A spec-compliant decoder must then assume frames may be reordered and hold up to
 // MaxDpbFrames (≈9 at 2880x1800, level 5.2) before outputting — ~150ms of lag while
@@ -196,13 +233,24 @@ static NSData *copyJpeg(uint64_t *seqOut) {
 // (Android MediaCodec / Qualcomm) do exactly that. Like WebRTC's SpsVuiRewriter, we
 // add bitstream_restriction with max_num_reorder_frames=0 and
 // max_dec_frame_buffering=max_num_ref_frames so every frame is output immediately.
-typedef struct { const uint8_t *p; size_t n, bit; BOOL err; } BitR;
-typedef struct { uint8_t *p; size_t cap, bit; } BitW;
+typedef struct {
+    const uint8_t *p;
+    size_t n, bit;
+    BOOL err;
+} BitR;
+typedef struct {
+    uint8_t *p;
+    size_t cap, bit;
+} BitW;
 static uint32_t br1(BitR *r) {
     if (r->bit >= r->n * 8) { r->err = YES; return 0; }
     uint32_t v = (r->p[r->bit >> 3] >> (7 - (r->bit & 7))) & 1; r->bit++; return v;
 }
-static uint32_t brN(BitR *r, int k) { uint32_t v = 0; while (k--) v = (v << 1) | br1(r); return v; }
+static uint32_t brN(BitR *r, int k) {
+    uint32_t v = 0;
+    while (k--) v = (v << 1) | br1(r);
+    return v;
+}
 static uint32_t brUE(BitR *r) {
     int z = 0; while (!br1(r) && !r->err && z < 32) z++;
     if (z > 31) { r->err = YES; return 0; }          // 1u<<32 is UB; oversized code = garbage
@@ -213,14 +261,24 @@ static void bw1(BitW *w, uint32_t b) {
     if (b) w->p[w->bit >> 3] |= (uint8_t)(0x80 >> (w->bit & 7));
     w->bit++;
 }
-static void bwN(BitW *w, uint32_t v, int k) { while (k--) bw1(w, (v >> k) & 1); }
+static void bwN(BitW *w, uint32_t v, int k) {
+    while (k--) bw1(w, (v >> k) & 1);
+}
 static void bwUE(BitW *w, uint32_t v) {
     uint32_t x = v + 1; int len = 0; while ((x >> len) > 1) len++;
     bwN(w, 0, len); bwN(w, x, len + 1);
 }
 // copy helpers: read from r, write identical bits to w, return value
-static uint32_t cN(BitR *r, BitW *w, int k) { uint32_t v = brN(r, k); bwN(w, v, k); return v; }
-static uint32_t cUE(BitR *r, BitW *w) { uint32_t v = brUE(r); bwUE(w, v); return v; }
+static uint32_t cN(BitR *r, BitW *w, int k) {
+    uint32_t v = brN(r, k);
+    bwN(w, v, k);
+    return v;
+}
+static uint32_t cUE(BitR *r, BitW *w) {
+    uint32_t v = brUE(r);
+    bwUE(w, v);
+    return v;
+}
 static void cHRD(BitR *r, BitW *w) {
     uint32_t cnt = cUE(r, w); cN(r, w, 4); cN(r, w, 4);
     for (uint32_t i = 0; i <= cnt && i < 32; i++) { cUE(r, w); cUE(r, w); cN(r, w, 1); }
@@ -366,6 +424,9 @@ static NSData *fixInbandSPS(NSData *au) {
 }
 
 // ============================================================ H.264 encoder
+// Publish AVCC output and codec configuration into the shared ring under g_lock.
+// Submission/setup helpers follow audio conversion; LOWLAT and NOVUI are the switches.
+// Bitrate bounds, burst limits and on-demand IDRs keep desktop text crisp without queues.
 static volatile double g_encLatMs = 0;   // avg submit -> encoded output
 static int64_t realtimeUsFromUptimeUs(int64_t upUs) {
     int64_t nowUp = (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000);
@@ -404,9 +465,13 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
     pthread_mutex_lock(&g_lock);
     uint64_t seq = g_auHead + 1;
     AURec *slot = &g_au[seq % AU_RING];
-    slot->seq = seq; slot->vseq = ++g_auVideoHead;
-    slot->isKey = isKey; slot->isRepeat = (srcRefCon != NULL); slot->isAudio = NO;
-    slot->ptsUs = ptsUs; slot->data = data;
+    slot->seq = seq;
+    slot->vseq = ++g_auVideoHead;
+    slot->isKey = isKey;
+    slot->isRepeat = (srcRefCon != NULL);
+    slot->isAudio = NO;
+    slot->ptsUs = ptsUs;
+    slot->data = data;
     g_auHead = seq;
     g_h264Bytes += len;
     g_encOutFrames++;
@@ -442,6 +507,8 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status,
 }
 
 // ============================================================ audio (system sound -> ring)
+// Convert SCK audio to stereo PCM records sharing the video's wall-clock timeline.
+// AUDIO=0 disables capture; fallback capture paths explicitly mark audio unavailable.
 // ScreenCaptureKit taps the system audio and delivers CMSampleBuffers on
 // g_audioQ. We flatten them (planar or interleaved Float32, any channel count)
 // to interleaved SInt16 stereo at g_audioRate and push them into the same AU
@@ -458,9 +525,13 @@ static void pushAudio(int64_t ptsUs, NSData *pcm) {
     pthread_mutex_lock(&g_lock);
     uint64_t seq = g_auHead + 1;
     AURec *slot = &g_au[seq % AU_RING];
-    slot->seq = seq; slot->vseq = g_auVideoHead;      // lag accounting stays video-only
-    slot->isKey = NO; slot->isRepeat = NO; slot->isAudio = YES;
-    slot->ptsUs = ptsUs; slot->data = pcm;
+    slot->seq = seq;
+    slot->vseq = g_auVideoHead;      // lag accounting stays video-only
+    slot->isKey = NO;
+    slot->isRepeat = NO;
+    slot->isAudio = YES;
+    slot->ptsUs = ptsUs;
+    slot->data = pcm;
     g_auHead = seq;
     pthread_cond_broadcast(&g_auCond);
     pthread_mutex_unlock(&g_lock);
@@ -545,6 +616,10 @@ static void processAudioSample(CMSampleBufferRef sb) {
     pushAudio(ptsUs, pcm);
 }
 
+// ============================================================ encoder submission and setup
+// All submissions use monotonic host-time PTS and consume the shared IDR request.
+// Push/refresh work runs on g_encQ; polling submits from its single capture thread.
+// Setup retains the existing low-latency, bitrate and pixel-buffer-pool policy.
 static uint64_t nowNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
 // single entry point into the encoder (call only on g_encQ or the polling thread)
@@ -679,6 +754,9 @@ static void encodeH264(CGImageRef img) {
 }
 
 // ============================================================ ScreenCaptureKit
+// Preferred damage-driven capture, with retained latest pixels for JPEG and refresh.
+// Refresh drains decoder-held final frames; watchdog falls back only on capture failure.
+// FPS, queue depth and idle-repeat timing remain defined at their decision sites.
 static void processFrame(CVPixelBufferRef pb);
 @interface SCOut : NSObject <SCStreamOutput, SCStreamDelegate>
 @end
@@ -912,6 +990,9 @@ static void *captureWatchdog(void *arg) {
 }
 
 // ============================================================ MJPEG (fallback only)
+// Produce the latest JPEG only when a stream or /frame.jpg asks for it (about 30fps).
+// Push buffers already contain the cursor; polling requires the separate cursor overlay.
+// The polling loop also feeds H.264 when push capture is unavailable.
 static volatile int g_wantJpeg = 0;   // one-shot request from /frame.jpg
 
 static CGImageRef imageFromPB(CVPixelBufferRef pb) {
@@ -1042,6 +1123,8 @@ static void *captureThread(void *arg) {
 }
 
 // ============================================================ http helpers
+// Bind IPv4 listeners with restart-friendly reuse and no SIGPIPE delivery.
+// Close-on-exec prevents listeners from leaking into an auto-fit replacement.
 static int listenSocket(uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); return -1; }
@@ -1061,6 +1144,8 @@ static int listenSocket(uint16_t port) {
 }
 
 // ============================================================ TLS (HTTPS port)
+// Wrap the blocking connection I/O without changing request handlers or stream framing.
+// TLS state is thread-local; identities load into memory only, with TLS 1.2 minimum.
 // Chrome only exposes WebCodecs (H.264 decode) to secure contexts. Serving HTTPS
 // with a local CA (certs.sh) makes https://<mac-ip>:8443 one — direct over Wi-Fi.
 // SecureTransport is deprecated but present and fits the blocking thread-per-
@@ -1195,6 +1280,9 @@ static BOOL writeAll(int fd, const void *buf, size_t len) {
     return YES;
 }
 #pragma clang diagnostic pop
+// ============================================================ response and stream helpers
+// Text writes use strlen; binary records carry explicit lengths and wall-clock times.
+// HTTP and HTTPS share writeAll so framing is identical on both listeners.
 static BOOL writeStr(int fd, const char *s) { return writeAll(fd, s, strlen(s)); }
 
 // print reachable URLs for every live IPv4 interface (IP changes with Wi-Fi networks)
@@ -1226,8 +1314,10 @@ static BOOL writeRec(int fd, uint8_t flags, int64_t tsUs, NSData *payload) {
     return ok;
 }
 
-// composite the system cursor into a frame context (CGDisplayCreateImage omits it).
-// cursor state is sampled at capture START (frame content + cursor stay in sync).
+// ============================================================ polling cursor overlay
+// CGDisplayCreateImage omits the cursor; polling capture composites a cached snapshot.
+// Sampling stays off the capture thread to avoid a WindowServer round-trip per frame.
+// Coordinate conversion distinguishes desktop points from framebuffer pixels.
 static pthread_mutex_t g_curLock = PTHREAD_MUTEX_INITIALIZER;
 static NSPoint g_curPos;            // global, bottom-left origin
 static NSImage *g_curImg = nil;
@@ -1293,429 +1383,14 @@ static void drawCursorOverlay(CGContextRef ctx) {
 }
 
 // ============================================================ player page
-static const char *INDEX_HTML =
-"<!doctype html><html><head><meta charset=utf-8>\n"
-"<meta name=viewport content='width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no'>\n"
-"<title>HoppScreen</title><style>\n"
-"html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}\n"
-"#c,#s{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;touch-action:none;display:none}\n"
-"#ui{position:fixed;inset:0;display:flex;flex-direction:column;gap:22px;align-items:center;justify-content:center;background:#000;z-index:9;color:#bbb;font:17px system-ui,sans-serif;text-align:center;padding:24px}\n"
-"#warn{color:#fb4;max-width:820px;line-height:1.5;display:none}\n"
-"#warn code{background:#222;padding:2px 6px;border-radius:4px;color:#fff}\n"
-"#st{color:#7f7;font:13px monospace;white-space:pre;pointer-events:none;text-align:left;line-height:1.5}\n"
-"#dr{position:fixed;top:0;right:0;bottom:0;width:290px;max-width:72vw;background:rgba(10,10,14,.93);color:#ddd;z-index:12;transform:translateX(105%);transition:transform .25s;padding:16px;box-sizing:border-box;font:14px system-ui;overflow-y:auto}\n"
-"#dr.on{transform:none}\n"
-"#tab{position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:11;background:rgba(10,10,14,.72);color:#ccc;border-radius:12px 0 0 12px;padding:22px 7px;font:17px system-ui;user-select:none;opacity:.55;transition:opacity .9s}\n"
-"#tab.dim{opacity:.12}\n"
-"button{font-size:22px;padding:18px 34px;border-radius:14px;border:0;background:#1a73e8;color:#fff;font-weight:600}\n"
-"</style></head><body>\n"
-"<canvas id=c></canvas><img id=s alt=''><video id=w playsinline loop muted preload=none style='position:fixed;left:0;top:0;width:1px;height:1px;opacity:0.01'></video><div id=st></div>\n"
-"<div id=ui><button id=go>&#9654; TAP FOR FULLSCREEN</button><div id=warn></div><div style='color:#666;font-size:14px'>tap the screen later to show/hide fps &middot; tap again after leaving fullscreen</div></div>\n"
-"<script>\n"
-"const $=i=>document.getElementById(i);\n"
-"const cv=$('c'),img=$('s'),st=$('st'),ui=$('ui');\n"
-"const WC=('VideoDecoder' in window);\n"
-" let alive=false,mode='',fpsN=0,fpsT=0,fps=0,info='';\n"
-"if(!WC){const w=$('warn');w.style.display='block';\n"
-" w.innerHTML='&#9888; Sharp low-latency H.264 needs a secure page. Falling back to MJPEG (blurry + laggy).';\n"
-" fetch('/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{if(!j.tls_port)return;\n"
-"  const u='https://'+location.hostname+':'+j.tls_port+'/';\n"
-"  if(!sessionStorage.triedTls){sessionStorage.triedTls=1;location.replace(u);return;}\n"
-"  w.innerHTML+='<br><br>Open the secure page: <a style=\"color:#8cf\" href=\"'+u+'\">'+u+'</a> (tap Advanced &rarr; Proceed to ignore the warning)<br>'+\n"
-"   'or install the CA once: download <a style=\"color:#8cf\" href=\"/ca.crt\">ca.crt</a> and add it under Settings &rarr; Security &rarr; Encryption &amp; credentials &rarr; Install a certificate &rarr; CA certificate.';\n"
-" }).catch(()=>{});}\n"
-"function report(x){fetch('/hello?mode='+mode+'&secure='+(window.isSecureContext?1:0)+'&screen='+\n"
-" Math.round(screen.width*devicePixelRatio)+'x'+Math.round(screen.height*devicePixelRatio)+'&dpr='+devicePixelRatio+(x||''),{cache:'no-store'}).catch(()=>{});}\n"
-"// latency instrumentation: frames carry their Mac capture time; clock offset via /time\n"
-"let off=0,latA=[],latS=[],lastRep=0,lastSend=0,finalLat=0;const rep=new Set();\n"
-"const srvNow=()=>performance.timeOrigin+performance.now()+off;\n"
-"async function clockSync(){let best=1e9;for(let i=0;i<6;i++){const t0=performance.now();\n"
-" const v=+(await (await fetch('/time',{cache:'no-store'})).text());const t1=performance.now();\n"
-" if(t1-t0<best){best=t1-t0;off=v/1000-(performance.timeOrigin+(t0+t1)/2);}}}\n"
-"const med=a=>{if(!a.length)return 0;const b=[...a].sort((x,y)=>x-y);return Math.round(b[b.length>>1]);};\n"
-"function latTick(q){const t=performance.now();if(t-lastRep<1000)return;\n"
-" const A=med(latA),S=med(latS);latA=[];latS=[];\n"
-" info=cvInfo+'\\nlatency: arrive '+A+'ms  shown '+S+'ms  last '+Math.round(finalLat)+'ms  q'+q;draw();\n"
-" if(t-lastSend>5000){lastSend=t;report('&arrive_ms='+A+'&shown_ms='+S+'&last_ms='+Math.round(finalLat)+'&fps='+fps+'&decq='+q);}lastRep=t;}\n"
-"let cvInfo='';\n"
-"function draw(){st.textContent=mode+' '+fps+' fps\\n'+info;}\n"
-"function tick(){fpsN++;const t=performance.now();if(t-fpsT>=1000){fps=fpsN;fpsN=0;fpsT=t;draw();}}\n"
-"const b64u8=b=>Uint8Array.from(atob(b),c=>c.charCodeAt(0));\n"
-"class Buf{constructor(){this.b=new Uint8Array(1<<20);this.o=0;this.n=0;}\n"
-" push(v){if(this.o&&this.b.length-this.n<v.length){this.b.copyWithin(0,this.o,this.n);this.n-=this.o;this.o=0;}\n"
-"  if(this.b.length-this.n<v.length){const t=new Uint8Array(Math.max(this.b.length*2,this.n+v.length));t.set(this.b.subarray(0,this.n));this.b=t;}\n"
-"  this.b.set(v,this.n);this.n+=v.length;}\n"
-" have(){return this.n-this.o;}\n"
-" u32(i){const b=this.b,o=this.o+i;return ((b[o]<<24)>>>0)+(b[o+1]<<16)+(b[o+2]<<8)+b[o+3];}\n"
-" take(k){const r=this.b.slice(this.o,this.o+k);this.o+=k;if(this.o===this.n){this.o=this.n=0;}return r;}}\n"
-"// audio: system sound arrives as SInt16 records (flag 4) -> AudioWorklet ring.\n"
-"// The context resumes on the first tap (autoplay policy); ~100ms prebuffer.\n"
-"let aCtx=null,aNode=null,aPend=[],aGo=false,aQueued=0;\n"
-"function audioInit(rate){\n"
-" try{\n"
-"  if(aCtx){try{if(aNode)aNode.disconnect();aCtx.close();}catch(e){}   // reconnect: drop the\n"
-"   aNode=null;aGo=false;aQueued=0;aPend.length=0;}                    // old graph + prebuffer state\n"
-"  aCtx=new AudioContext({latencyHint:'interactive',sampleRate:rate});\n"
-"  const src='class H extends AudioWorkletProcessor{constructor(){super();this.q=[];this.ri=0;this.go=false;'+\n"
-"   'this.port.onmessage=e=>{if(e.data===\\'go\\')this.go=true;else this.q.push(e.data)};};'+\n"
-"   'process(_,o){const L=o[0][0],R=o[0][1];if(!this.go)return true;'+\n"
-"   'for(let i=0;i<L.length;i++){while(this.q.length&&this.ri*2>=this.q[0].length){this.q.shift();this.ri=0;}'+\n"
-"   'const b=this.q[0];if(!b){L[i]=0;R[i]=0;}else{L[i]=b[this.ri*2];R[i]=b[this.ri*2+1];this.ri++;}}'+\n"
-"   'if(!this.q.length){this.go=false;this.port.postMessage(\\'starved\\');}'+   // underrun: re-prebuffer\n"
-"   'if(this.q.length>16){this.q.length=0;this.ri=0;}return true;}}'+\n"
-"   'registerProcessor(\\'h\\',H);';\n"
-"  const url=URL.createObjectURL(new Blob([src],{type:'application/javascript'}));\n"
-"  aCtx.audioWorklet.addModule(url).then(()=>{\n"
-"   aNode=new AudioWorkletNode(aCtx,'h',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2]});\n"
-"   aNode.port.onmessage=e=>{if(e.data==='starved'){aGo=false;aQueued=0;}}\n"
-"   aNode.connect(aCtx.destination);\n"
-"   aCtx.resume().catch(()=>{});\n"
-"  }).catch(()=>{});\n"
-" }catch(e){}\n"
-"}\n"
-"function audioFeed(i16){\n"
-" if(!aCtx||!aNode)return;\n"
-" if(!aGo&&aCtx.state!=='running'&&aQueued>aCtx.sampleRate*0.6)return;  // autoplay-blocked: don't pile up\n"
-" const f=new Float32Array(i16.length);\n"
-" for(let i=0;i<i16.length;i++)f[i]=i16[i]/32768;\n"
-" if(!aGo){aPend.push(f);aQueued+=f.length/2;\n"
-"  if(aQueued>=aCtx.sampleRate*0.1){\n"
-"   for(const b of aPend)aNode.port.postMessage(b);\n"
-"   aPend.length=0;aGo=true;aNode.port.postMessage('go');}\n"
-"  return;}\n"
-" aNode.port.postMessage(f);\n"
-"}\n"
-"// ---- input: the receiver becomes a touchscreen -------------------------\n"
-"// full gesture engine -> POST /input; the Mac replays native events:\n"
-"//   1 finger: tap (single/double/triple click), long-press = right click,\n"
-"//             drag; drag started right after a double-tap = word-select\n"
-"//   2 fingers: tap = right click, swipe = scroll, pinch = zoom (Cmd+wheel)\n"
-"//   3+ fingers: tap = middle click, swipe = Spaces / Mission Control /\n"
-"//              App Windows (iPadOS claims some of these - see README)\n"
-"// aspect comes from the visible element's own bitmap, so it works for both\n"
-"// the h264 canvas and the mjpeg img regardless of letterboxing.\n"
-"let lastTouch=0,lastInp=0,mvT=0,chainN=0,chainT=0,chainPt=null,inputOn=null;\n"
-"// windowed = page control (tap restores fullscreen); fullscreen = Mac input.\n"
-"// fsBroken: browser refused fullscreen (e.g. API missing) -> input stays on.\n"
-"// inputOn: runtime presenter-mode toggle (server /input/toggle); null = unknown.\n"
-"const inpOn=()=>armed&&inputOn!==false&&(document.fullscreenElement||fsBroken);\n"
-"const G={state:'',t0:0,start:[0,0],mode:'',fired:false,drag:false,lpT:0,lpFired:false,\n"
-"         sep0:0,sepPrev:null,scPrev:null,scT:0,cx0:0,cy0:0,gx:0,gy:0};\n"
-"function normXY(cx,cy){\n"
-" const el=cv.style.display==='none'?img:cv;\n"
-" const W=el===cv?cv.width:(img.naturalWidth||0),H=el===cv?cv.height:(img.naturalHeight||0);\n"
-" if(!W||!H)return null;\n"
-" // measure the ELEMENT (not innerWidth/Height: 100vh on iPad can exceed the\n"
-" // visible viewport, which would shift the object-fit letterbox)\n"
-" const r=el.getBoundingClientRect();\n"
-" let w=r.width,h=r.width*H/W;\n"
-" if(h>r.height){h=r.height;w=r.height*W/H;}\n"
-" const x=(cx-(r.left+(r.width-w)/2))/w,y=(cy-(r.top+(r.height-h)/2))/h;\n"
-" return [x<0?0:x>1?1:x,y<0?0:y>1?1:y];\n"
-"}\n"
-"function ripple(x,y){                            // visual: where a tap registered\n"
-" const d=document.createElement('div');\n"
-" d.style.cssText='position:fixed;left:'+x+'px;top:'+y+'px;width:26px;height:26px;'\n"
-"  +'border:2px solid rgba(255,255,255,.9);border-radius:50%;pointer-events:none;'\n"
-"  +'transform:translate(-50%,-50%);transition:opacity .35s,width .35s,height .35s;opacity:.9';\n"
-" document.body.appendChild(d);\n"
-" requestAnimationFrame(()=>{d.style.width='70px';d.style.height='70px';d.style.opacity='0';});\n"
-" setTimeout(()=>d.remove(),400);\n"
-"}\n"
-"// single-flight event queue: one POST in flight at a time, order preserved\n"
-"// (fetches over separate connections can otherwise arrive out of order and\n"
-"// turn down+move+up into garbage). Consecutive trailing moves coalesce.\n"
-"let iqBusy=false,iqQ=[];\n"
-"function inp(o){\n"
-" lastInp=Date.now();\n"
-" if(o.t==='move'){while(iqQ.length&&iqQ[iqQ.length-1].t==='move')iqQ.pop();}\n"
-" iqQ.push(o);\n"
-" if(iqQ.length>40)iqQ.splice(0,iqQ.length-40);          // flood cap\n"
-" iqFlush();\n"
-"}\n"
-"function iqFlush(){\n"
-" if(iqBusy||!iqQ.length)return;iqBusy=true;\n"
-" const o=iqQ.shift();\n"
-" fetch('/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})\n"
-"  .catch(()=>{}).finally(()=>{iqBusy=false;iqFlush();});\n"
-"}\n"
-"function pos(T){let x=0,y=0;for(const t of T){x+=t.clientX;y+=t.clientY;}return [x/T.length,y/T.length];}\n"
-"// scroll pipeline: one POST in flight (order + coalescing), flick acceleration,\n"
-"// glide after lift. Every scroll carries the finger position so the Mac can\n"
-"// warp the cursor — wheel events otherwise hit whatever screen the real mouse\n"
-"// was last on, not the window under the fingers.\n"
-"let scBusy=false,scAcc=[0,0],scAt=[0.5,0.5],scMom=0;\n"
-"function scSend(dx,dy,at){\n"
-" if(at){scAt[0]=at[0];scAt[1]=at[1];}\n"
-" if(scBusy){scAcc[0]+=dx;scAcc[1]+=dy;return;}\n"
-" scBusy=true;const px=scAt[0],py=scAt[1];\n"
-" fetch('/input',{method:'POST',headers:{'Content-Type':'application/json'},\n"
-"  body:JSON.stringify({t:'scroll',dx:dx,dy:dy,x:px,y:py})}).catch(()=>{}).finally(()=>{\n"
-"   scBusy=false;\n"
-"   if(scAcc[0]||scAcc[1]){const x=scAcc[0],y=scAcc[1];scAcc[0]=scAcc[1]=0;scSend(x,y);}\n"
-"  });\n"
-"}\n"
-"function scPost(dx,dy,at){                        // finger delta -> accelerated wheel\n"
-" const m=1.9+Math.min(2.4,Math.hypot(dx,dy)*0.008);\n"
-" scSend(Math.round(dx*m),Math.round(dy*m),at);\n"
-"}\n"
-"function gReset(){G.state='';G.mode='';G.fired=false;G.drag=false;G.lpFired=false;\n"
-" clearTimeout(G.lpT);G.sepPrev=null;G.scPrev=null;G.vx=G.vy=0;G.vt=0;}\n"
-"function abortInput(){                           // never leave the Mac's button held\n"
-" clearInterval(scMom);clearTimeout(G.lpT);\n"
-" if(G.drag){G.drag=false;inp({t:'up'});}\n"
-" gReset();\n"
-"}\n"
-"addEventListener('touchcancel',abortInput);\n"
-"addEventListener('blur',abortInput);\n"
-"addEventListener('pagehide',abortInput);\n"
-"document.addEventListener('visibilitychange',()=>{if(document.hidden)abortInput();});\n"
-"document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement)abortInput();});\n"
-"addEventListener('touchstart',e=>{\n"
-" lastTouch=Date.now();\n"
-" clearInterval(scMom);                           // touching stops any glide\n"
-" if(drOpen&&!uiEl(e.target)){openDr(false);return;}   // tap outside closes it, swallows the tap\n"
-" if(uiEl(e.target))return;                            // drawer/tab never click the Mac\n"
-" if(!inpOn())return;\n"
-" const T=e.touches,n=T.length;\n"
-" if(n===1){\n"
-"  const p=normXY(T[0].clientX,T[0].clientY);if(!p)return;\n"
-"  G.rx=T[0].clientX;G.ry=T[0].clientY;         // raw px for the ripple\n"
-"  // multi-tap chain: this touch continues a recent tap at the same spot\n"
-"  if(chainN&&chainN<3&&Date.now()-chainT<320&&chainPt&&\n"
-"     Math.abs(p[0]-chainPt[0])+Math.abs(p[1]-chainPt[1])<0.06)chainN++;\n"
-"  else chainN=1;\n"
-"  gReset();G.state='touch';G.t0=Date.now();G.start=p;\n"
-"  G.lpT=setTimeout(()=>{if(G.state==='touch'&&!G.drag){G.lpFired=true;chainN=0;\n"
-"   ripple(G.rx,G.ry);inp({t:'rclick',x:G.start[0],y:G.start[1]});}},480);\n"
-" }else{                                          // extra fingers: upgrade gesture\n"
-"  clearTimeout(G.lpT);\n"
-"  if(G.drag)inp({t:'up'});G.drag=false;\n"
-"  const prev=G.state;                            // mid-gesture upgrades never count as taps\n"
-"  const p=pos(T);G.state=n===2?'two':'multi';G.t0=Date.now();G.mode='';\n"
-"  G.fired=prev!=='';\n"
-"  G.cx0=p[0];G.cy0=p[1];G.scPrev=null;G.sepPrev=null;\n"
-"  if(n===2)G.sep0=Math.hypot(T[0].clientX-T[1].clientX,T[0].clientY-T[1].clientY);\n"
-"  const q=normXY(p[0],p[1]);if(q)G.start=q;\n"
-" }\n"
-"},{passive:false});\n"
-"addEventListener('touchmove',e=>{\n"
-" lastTouch=Date.now();                           // long gestures keep synthetic-mouse suppression armed\n"
-" if(drOpen||uiEl(e.target))return;               // drawer open: let it scroll natively\n"
-" if(!inpOn())return;\n"
-" e.preventDefault();\n"
-" const T=e.touches,n=T.length;\n"
-" if(n===1&&G.state==='touch'){\n"
-"  const p=normXY(T[0].clientX,T[0].clientY);if(!p)return;\n"
-"  const d=Math.abs(p[0]-G.start[0])+Math.abs(p[1]-G.start[1]);\n"
-"  if(G.drag){\n"
-"   if(Date.now()-mvT>30){mvT=Date.now();inp({t:'move',x:p[0],y:p[1]});}\n"
-"  }else if(!G.lpFired&&d>0.012){                 // deliberate move -> drag\n"
-"   clearTimeout(G.lpT);\n"
-"   const c=chainN>1?2:1;                        // double-tap-drag = word select\n"
-"   chainN=0;G.drag=true;mvT=Date.now();\n"
-"   inp({t:'down',x:G.start[0],y:G.start[1],c:c});inp({t:'move',x:p[0],y:p[1]});\n"
-"  }\n"
-"  return;\n"
-" }\n"
-" if(n===2&&G.state==='two'){\n"
-"  const c=pos(T),sep=Math.hypot(T[0].clientX-T[1].clientX,T[0].clientY-T[1].clientY);\n"
-"  const now=Date.now();\n"
-"  const q=normXY(c[0],c[1]);if(q){G.sx=q[0];G.sy=q[1];}   // gesture position\n"
-"  if(!G.mode){                                   // classify with hysteresis\n"
-"   if(Math.abs(sep-G.sep0)>28)G.mode='pinch';\n"
-"   else if(Math.hypot(c[0]-G.cx0,c[1]-G.cy0)>10)G.mode='scroll';\n"
-"   else return;\n"
-"  }\n"
-"  if(G.mode==='pinch'){\n"
-"   if(now-mvT>40){const dz=sep-(G.sepPrev!=null?G.sepPrev:G.sep0);G.sepPrev=sep;mvT=now;\n"
-"    inp({t:'scroll',zoom:1,dy:dz*2,x:G.sx,y:G.sy});}\n"
-"  }else{                                         // scroll: accelerated, ordered, positioned\n"
-"   if(!G.scPrev){G.scPrev=c;G.scT=now;G.vx=G.vy=0;return;}\n"
-"   if(now-G.scT>=40){\n"
-"    const dx=c[0]-G.scPrev[0],dy=c[1]-G.scPrev[1];   // sign: content follows fingers\n"
-"    G.vx=dx/(now-G.scT);G.vy=dy/(now-G.scT);G.vt=now;// px/ms, seeds the glide\n"
-"    scPost(dx,dy,[G.sx,G.sy]);\n"
-"    G.scT=now;G.scPrev=c;\n"
-"   }\n"
-"  }\n"
-"  return;\n"
-" }\n"
-" // NOTE: no 3/4-finger SWIPE mappings — iPadOS claims those gestures first\n"
-" // (3-finger swipe = screenshot / undo, 4/5-finger = multitasking) and the\n"
-" // browser never sees them. Quick multi-finger TAPS are not claimed -> kept\n"
-" // below as middle click.\n"
-"},{passive:false});\n"
-"addEventListener('touchend',e=>{\n"
-" lastTouch=Date.now();\n"
-" if(!armed&&!G.drag)return;              // still finish a drag after losing fullscreen\n"
-" clearTimeout(G.lpT);\n"
-" if(e.touches.length)return;                     // fingers remain: gesture continues\n"
-" const dt=Date.now()-G.t0;\n"
-" if(G.drag)inp({t:'up'});\n"
-" else if(G.state==='two'&&!G.mode&&!G.fired&&dt<300){ripple(G.rx,G.ry);inp({t:'rclick',x:G.start[0],y:G.start[1]});}\n"
-" else if(G.state==='multi'&&!G.fired&&dt<300){ripple(G.rx,G.ry);inp({t:'mclick',x:G.start[0],y:G.start[1]});}\n"
-" else if(G.state==='touch'&&!G.lpFired){\n"
-"  chainT=Date.now();chainPt=G.start;             // remember for the chain window\n"
-"  ripple(G.rx,G.ry);\n"
-"  inp({t:'tap',x:G.start[0],y:G.start[1],c:Math.min(chainN,3)});\n"
-" }\n"
-" else if(G.state==='two'&&G.mode==='scroll'&&(G.vx||G.vy)&&Date.now()-G.vt<140){   // fresh flick -> glide\n"
-"  let vx=G.vx,vy=G.vy;clearInterval(scMom);\n"
-"  scMom=setInterval(()=>{\n"
-"   if(!inpOn()){clearInterval(scMom);return;}\n"
-"   vx*=0.90;vy*=0.90;\n"
-"   if(Math.hypot(vx,vy)<0.015){clearInterval(scMom);return;}\n"
-"   scPost(vx*40,vy*40,[G.sx,G.sy]);},40);\n"
-" }\n"
-" gReset();\n"
-"},{passive:false});\n"
-"// mouse + wheel: a laptop browser drives the Mac too (hover, drag, wheel;\n"
-"// ctrl+wheel = trackpad pinch -> Mac zoom). dblclick = double-click on the\n"
-"// Mac AND toggles the stats overlay (plain taps click the Mac now).\n"
-"// lastTouch (real touches only) swallows Safari's synthetic mouse events.\n"
-"addEventListener('mousedown',e=>{if(!inpOn()||Date.now()-lastTouch<800||e.button!==0)return;\n"
-" if(drOpen&&!uiEl(e.target)){openDr(false);return;}\n"
-" if(uiEl(e.target))return;\n"
-" const p=normXY(e.clientX,e.clientY);if(!p)return;G.drag=true;\n"
-" inp({t:'down',x:p[0],y:p[1],c:Math.max(1,Math.min(3,e.detail||1))});});\n"
-"addEventListener('mousemove',e=>{if(!inpOn()||Date.now()-lastTouch<800||Date.now()-mvT<=30)return;\n"
-" mvT=Date.now();const p=normXY(e.clientX,e.clientY);if(p)inp({t:'move',x:p[0],y:p[1]});});\n"
-"addEventListener('mouseup',()=>{if(G.drag){G.drag=false;inp({t:'up'});}});\n"
-"addEventListener('dblclick',e=>{if(!inpOn()||Date.now()-lastTouch<800)return;\n"
-" openDr(!drOpen);});\n"   // native double-click comes via the two down/up pairs
-"addEventListener('wheel',e=>{if(!inpOn()||Date.now()-lastTouch<800)return;\n"
-" const p=normXY(e.clientX,e.clientY)||[0.5,0.5];\n"
-" if(e.ctrlKey)inp({t:'scroll',zoom:1,dy:-e.deltaY,x:p[0],y:p[1]});   // trackpad pinch\n"
-" else inp({t:'scroll',dx:-e.deltaX,dy:-e.deltaY,x:p[0],y:p[1]});},{passive:true});\n"
-"// ---- side drawer: stats + input control. Nothing floats over the picture:\n"
-"// a small ⓘ tab on the right edge summons it; it slides away when done.\n"
-"// The input control obeys the backend: it can only flip what the server\n"
-"// allows (input_wanted + input_trusted from /status).\n"
-"const dr=document.createElement('div');dr.id='dr';\n"
-"dr.innerHTML='<div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:12px\">'\n"
-" +'<b>HoppScreen</b><button id=drx style=\"background:none;border:none;color:#999;font:20px system-ui;padding:2px 8px\">\\u2715</button></div>';\n"
-"document.body.appendChild(dr);\n"
-"dr.appendChild(st);                                 // the stats block lives in here now\n"
-"const tab=document.createElement('div');tab.id='tab';tab.textContent='\\u24d8';\n"
-"document.body.appendChild(tab);\n"
-"setTimeout(()=>tab.classList.add('dim'),4000);      // fades to a whisper after settling in\n"
-"let drOpen=false;\n"
-"function openDr(v){drOpen=!!v;dr.classList.toggle('on',drOpen);}\n"
-"tab.addEventListener('click',e=>{e.stopPropagation();tab.classList.remove('dim');openDr(!drOpen);});\n"
-"tab.addEventListener('touchend',e=>{e.stopPropagation();e.preventDefault();tab.classList.remove('dim');openDr(!drOpen);},{passive:false});\n"
-"dr.querySelector('#drx').addEventListener('click',e=>{e.stopPropagation();openDr(false);});\n"
-"function uiEl(t){return !!(t&&t.closest&&t.closest('#dr,#tab'));}\n"
-"// input control: shown once /status says whether the backend permits input\n"
-"let inputAllowed=null,inputWhy='';\n"
-"const inSec=document.createElement('div');inSec.style.cssText='margin-top:16px';\n"
-"const inHdr=document.createElement('div');inHdr.textContent='Input';\n"
-"inHdr.style.cssText='font-weight:600;margin-bottom:6px;color:#eee';\n"
-"const btnIn=document.createElement('button');\n"
-"btnIn.style.cssText='width:100%;padding:10px;margin-top:2px;border-radius:8px;border:1px solid rgba(255,255,255,.35);background:rgba(0,0,0,.6);color:#fff;font:14px system-ui';\n"
-"const inWhy=document.createElement('div');\n"
-"inWhy.style.cssText='font:12px system-ui;color:#999;margin-top:6px;line-height:1.4';\n"
-"inSec.appendChild(inHdr);inSec.appendChild(btnIn);inSec.appendChild(inWhy);\n"
-"inSec.style.display='none';\n"
-"dr.appendChild(inSec);\n"
-"function updInput(){\n"
-" if(inputAllowed===null){inSec.style.display='none';return;}\n"
-" inSec.style.display='block';\n"
-" if(!inputAllowed){\n"
-"  btnIn.disabled=true;btnIn.style.opacity=.55;btnIn.textContent='\\uD83D\\uDD12 Input unavailable';\n"
-"  inWhy.textContent=inputWhy;return;\n"
-" }\n"
-" btnIn.disabled=false;btnIn.style.opacity=1;\n"
-" btnIn.textContent=inputOn===false?'\\uD83D\\uDD12 View-only — tap to control':'\\uD83D\\uDC58 Controlling the Mac — tap for view-only';\n"
-" inWhy.textContent=inputOn===false?'input is disabled; touches do nothing':'your touches click the Mac';\n"
-"}\n"
-"function toggleInp(){\n"
-" if(inputAllowed!==true)return;\n"
-" fetch('/input/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})\n"
-"  .then(r=>r.text()).then(t=>{inputOn=t==='on';updInput();}).catch(()=>{});\n"
-"}\n"
-"btnIn.addEventListener('click',e=>{e.stopPropagation();toggleInp();});\n"
-"btnIn.addEventListener('touchend',e=>{e.stopPropagation();e.preventDefault();toggleInp();},{passive:false});\n"
-"async function startH264(){\n"
-" const res=await fetch('/h264',{cache:'no-store'});\n"
-" if(res.status===401){location.reload();throw new Error('401');}   // login lost: 401 on / re-prompts\n"
-" if(!res.ok||!res.body)throw new Error('no h264');\n"
-" await clockSync().catch(()=>{});\n"
-" const rd=res.body.getReader();const buf=new Buf();let cfg=null,dec=null,g=null,bad=false;\n"
-" try{\n"
-"  while(alive&&!bad){\n"
-"   const {done,value}=await rd.read();if(done)break;buf.push(value);\n"
-"   if(!cfg){if(buf.have()<4)continue;const L=buf.u32(0);if(buf.have()<4+L)continue;\n"
-"    buf.take(4);cfg=JSON.parse(new TextDecoder().decode(buf.take(L)));\n"
-"    if(cv.width!==cfg.w||cv.height!==cfg.h){cv.width=cfg.w;cv.height=cfg.h;}\n"
-"    g=cv.getContext('2d',{alpha:false,desynchronized:true});\n"
-"    dec=new VideoDecoder({output:f=>{g.drawImage(f,0,0,cv.width,cv.height);if(rep.delete(f.timestamp)){}else{finalLat=srvNow()-f.timestamp/1000;latS.push(finalLat);}f.close();tick();latTick(dec.decodeQueueSize);},\n"
-"     error:e=>{console.warn(e);bad=true;report('&err='+encodeURIComponent('decoder: '+e.message));}});\n"
-"    const c={codec:cfg.codec,description:b64u8(cfg.desc),optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'};\n"
-"    try{if(!(await VideoDecoder.isConfigSupported(c)).supported)delete c.hardwareAcceleration;}catch(e){delete c.hardwareAcceleration;}\n"
-"    dec.configure(c);cv.style.display='block';img.style.display='none';\n"
-"    cvInfo=info=cfg.w+'x'+cfg.h+' '+cfg.codec+(cfg.arate?' +audio':'');report();\n"
-"    if(cfg.arate)audioInit(cfg.arate);\n"
-"   }\n"
-"   while(buf.have()>=13){const L=buf.u32(0);if(buf.have()<13+L)break;\n"
-"    const fl=buf.b[buf.o+4],ts=buf.u32(5)*4294967296+buf.u32(9);buf.take(13);const data=buf.take(L);\n"
-"    if(fl&4){if(L>3)audioFeed(new Int16Array(data.buffer,data.byteOffset,L>>1));continue;}\n"
-"    if(fl&2)rep.add(ts);else latA.push(srvNow()-ts/1000);\n"
-"    if(L>0&&dec.state==='configured')dec.decode(new EncodedVideoChunk({type:(fl&1)?'key':'delta',timestamp:ts,data}));\n"
-"   }\n"
-"  }\n"
-" }finally{try{rd.cancel();}catch(e){}try{if(dec&&dec.state!=='closed')dec.close();}catch(e){}}\n"
-"}\n"
-"function startMjpeg(){mode='mjpeg';report();img.style.display='block';cv.style.display='none';\n"
-" img.onerror=()=>{if(alive)setTimeout(()=>{img.src='/stream.mjpg?t='+Date.now();},900);};\n"
-" img.onload=()=>tick();img.src='/stream.mjpg?t='+Date.now();}\n"
-"async function fit(){try{const s=await(await fetch('/status',{cache:'no-store'})).json();\n"
-" if('input' in s){\n"
-"  inputOn=!!s.input;\n"
-"  inputAllowed=s.input_wanted!==false&&s.input_trusted!==false;\n"
-"  inputWhy=s.input_wanted===false?'the Mac is running view-only (started with INPUT=0)'\n"
-"           :'allow hoppscreen on the Mac: System Settings > Privacy & Security > Accessibility';\n"
-"  updInput();\n"
-" }\n"
-" const W=Math.round(screen.width*devicePixelRatio),H=Math.round(screen.height*devicePixelRatio);\n"
-" if(!W||!H||W<500||H<500)return;if(Math.abs(W-s.pixel_width)<=W/8&&Math.abs(H-s.pixel_height)<=H/8)return;\n"
-" let hz=0;const d=[];let n=0;await new Promise(r=>requestAnimationFrame(function f(t){d.push(t);if(++n>=24)r();else requestAnimationFrame(f)}));\n"
-" if(d.length>5){const dt=d[d.length-1]-d[0];if(dt>0)hz=Math.round(1000*(d.length-1)/dt);}\n"
-" await fetch('/fit',{method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',\n"
-"  body:JSON.stringify({w:W,h:H,dpr:devicePixelRatio,hz:hz||60})});\n"
-"}catch(e){}}\n"
-"async function start(){\n"
-" alive=true;st.style.display='block';\n"
-" fit();\n"
-" if(WC){mode='h264';\n"
-"  while(alive){try{await startH264();}catch(e){console.warn(e);report('&err='+encodeURIComponent(String(e&&e.message||e)));}\n"
-"   if(!alive)break;await new Promise(r=>setTimeout(r,500));}\n"
-" } else startMjpeg();\n"
-"}\n"
-"const wv=$('w');\n"
-"function keepAwake(){if(wv.paused)wv.play().catch(()=>{});try{navigator.wakeLock&&navigator.wakeLock.request('screen').catch(()=>{});}catch(e){}}\n"
-"let fsBroken=false;\n"
-"async function goFull(){try{if(!document.fullscreenElement)await document.documentElement.requestFullscreen({navigationUI:'hide'});}catch(e){fsBroken=true;}\n"
-" try{await screen.orientation.lock('landscape');}catch(e){}}\n"
-"// stream starts immediately (decoder warm before the tap); fullscreen needs a user gesture\n"
-"start();\n"
-"let armed=false;\n"
-"document.addEventListener('click',async e=>{\n"
-" if(uiEl(e.target))return;\n"
-" if(drOpen){openDr(false);return;}\n"
-" if(!armed){armed=true;ui.remove();await goFull();\n"
-"  if(aCtx&&aCtx.state!=='running')aCtx.resume().catch(()=>{});\n"
-"  wv.src='/silent.mp4';wv.volume=0;await wv.play().catch(()=>{});keepAwake();setInterval(keepAwake,5000);\n"
-"  setTimeout(fit,1200);                          // re-fit after orientation settles\n"
-"  return;}\n"
-" if(!document.fullscreenElement){goFull();return;}   // left fullscreen: any tap restores it\n"
-" if(Date.now()-lastTouch<800||Date.now()-lastInp<800)return;   // input already acted\n"
-" openDr(!drOpen);                                  // plain click (no input action): drawer\n"
-"});\n"
-"document.addEventListener('visibilitychange',()=>{if(!document.hidden)keepAwake();});\n"
-"</script></body></html>\n";
+// Receiver layout/styles/script remain together in their original byte order.
+// CSS is in <style>, page markup precedes <script>, and the AudioWorklet uses a blob.
+// The exact receiver bytes live in web/index.html; make embeds them in
+// web_index.h. The array has no trailing NUL: always use its explicit length.
 
 // ============================================================ password protection
+// Validate Basic credentials against a password digest, with constant-time comparison.
+// The handler gate exempts IPv4 loopback; header helpers bound lookup to header lines.
 // The server is reachable by anyone on the same Wi-Fi, so every endpoint
 // requires HTTP Basic auth. The receiver's browser asks once, remembers it for the
 // origin and attaches it to every following request (player page, /h264,
@@ -1790,8 +1465,10 @@ static BOOL isJsonContent(const char *req) {
 }
 
 // ============================================================ auto-fit (/fit)
+// Re-exec preserves pid/logging while rebuilding the display at the receiver's size.
+// Explicit size args pin by default; AUTOFIT overrides, LASTFIT carries the cooldown.
 // HoppScreen is generic: the receiver may be any device with a browser. The
-// page compares its own panel with /status and calls /fit?w=&h=&dpr=&hz=;
+// page compares its own panel with /status and posts {w,h,dpr,hz} to /fit;
 // if the current framebuffer is far off, the server re-execs itself with
 // matching display arguments. execv keeps the pid (so make's pidfile stays
 // valid) and the log fd; WindowServer reaps the old virtual display, and
@@ -1834,6 +1511,8 @@ static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) {
 }
 
 // ============================================================ touch input (/input)
+// Validate normalized gestures before applying them in order on g_inputQ.
+// Boot opt-in, the live toggle and Accessibility trust are separate acceptance gates.
 // The other direction of the pipe: the page posts touch events here and the
 // server replays them onto the virtual display with CGEventPost — the receiver
 // becomes a touchscreen for the Mac (tap=click, long-press=right-click,
@@ -1845,7 +1524,7 @@ static void refitExec(uint32_t ptW, uint32_t ptH, double fps, BOOL hiDPI) {
 //   - POST-only + Content-Type: application/json, so a page from another site
 //     open in the receiver's browser cannot forge events (no-cors requests
 //     cannot carry that header). Auth applies as everywhere else.
-//   - HOPPSCREEN_INPUT=0 disables (view-only).
+//   - Input is view-only unless HOPPSCREEN_INPUT is set to a nonzero integer.
 static volatile BOOL g_inputWanted = NO;       // env boot default (HOPPSCREEN_INPUT)
 static BOOL g_inputTrusted = NO;               // Accessibility granted
 static BOOL g_inputEnabled = YES;              // runtime toggle (presenter mode), POST /input/toggle
@@ -1974,6 +1653,9 @@ static void applyInputEvent(NSDictionary *ev) {
 }
 
 // ============================================================ handlers
+// One bounded request per connection, authenticated before route dispatch.
+// H.264 starts on a fresh IDR and drops ~250ms backlogs rather than accumulating delay.
+// JSON-only mutation routes and a shared listener budget bound receiver-side work.
 static void handleClient(int fd, BOOL tls) {
     @autoreleasepool {
         if (tls && !tlsAccept(fd)) { close(fd); return; }
@@ -2001,10 +1683,7 @@ static void handleClient(int fd, BOOL tls) {
         if (strcmp(path, "/hello") != 0 && strcmp(path, "/time") != 0 && strcmp(path, "/input") != 0)
             fprintf(stderr, "[%s] %s %s%s%s\n", tls ? "https" : "http", method, path, ua[0] ? "  UA=" : "", ua);
 
-        // password gate — every endpoint, on both http and https. After the first
-        // successful login the receiver's browser caches the credentials and attaches
-        // them to all requests (page, /h264, /stream.mjpg), so the player page
-        // itself needs no changes. Connections from this Mac (127.0.0.1) are exempt.
+        // Apply the same password gate before dispatch on either listener.
         if (g_authHash && !isLoopbackPeer(fd) && !requestAuthorized(req)) {
             char ip[48]; peerIp(fd, ip, sizeof(ip));
             fprintf(stderr, "[auth] %s %s from %s — wrong or missing password\n",
@@ -2029,8 +1708,8 @@ static void handleClient(int fd, BOOL tls) {
             char hdr[256];
             snprintf(hdr, sizeof(hdr),
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %zu\r\n"
-                "Cache-Control: no-store\r\nConnection: close\r\n\r\n", strlen(INDEX_HTML));
-            writeStr(fd, hdr); writeStr(fd, INDEX_HTML);
+                "Cache-Control: no-store\r\nConnection: close\r\n\r\n", (size_t)web_index_html_len);
+            writeStr(fd, hdr); writeAll(fd, (const char *)web_index_html, web_index_html_len);
         }
         else if (strcmp(path, "/ca.crt") == 0) {
             if (!g_caCert) writeStr(fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
@@ -2225,7 +1904,6 @@ static void handleClient(int fd, BOOL tls) {
             }
         }
         else if (strcmp(path, "/input") == 0) {
-            // touch backchannel; see the "touch input" section above
             if (strcmp(method, "POST") != 0 || !isJsonContent(req)) {
                 writeStr(fd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             } else if (!g_inputWanted || !g_inputEnabled) {
@@ -2420,6 +2098,9 @@ static void *serverThread(void *arg) {
 }
 
 // ============================================================ main
+// Resolve launch policy, create/place the display, then initialize encoder and listeners.
+// Start capture and background workers only after resources and credentials are ready.
+// Shutdown stops capture before releasing the virtual display owner.
 static void onSig(int sig) { fprintf(stderr, "[sig] %d -> shutdown\n", sig); g_running = NO; }
 
 int main(int argc, char **argv) {
@@ -2432,11 +2113,15 @@ int main(int argc, char **argv) {
     g_fps = argc > 4 ? atof(argv[4]) : 120.0;   // high-hz panels: 120 halves per-frame latency
     // env fallbacks: a launcher can set port/fps WITHOUT pinning
     // the size — positional args would disable auto-fit. Positional args win.
-    if (argc <= 3) { const char *e = getenv("HOPPSCREEN_PORT");
-        if (e && atoi(e) > 0 && atoi(e) < 65536) port = (uint16_t)atoi(e); }
-    if (argc <= 4) { const char *e = getenv("HOPPSCREEN_FPS");
+    if (argc <= 3) {
+        const char *e = getenv("HOPPSCREEN_PORT");
+        if (e && atoi(e) > 0 && atoi(e) < 65536) port = (uint16_t)atoi(e);
+    }
+    if (argc <= 4) {
+        const char *e = getenv("HOPPSCREEN_FPS");
         double f = e ? atof(e) : 0;
-        if (isfinite(f) && f >= 1 && f <= 120) g_fps = f; }
+        if (isfinite(f) && f >= 1 && f <= 120) g_fps = f;
+    }
     BOOL hiDPI = !(getenv("HOPPSCREEN_SCALE") && atoi(getenv("HOPPSCREEN_SCALE")) == 1);
     if (!w || !h || !port || w < 500 || h < 500 || w > 3840 || h > 2400 ||
         !isfinite(g_fps) || g_fps < 1 || g_fps > 120) {   // atof("nan") would pass < and > checks
@@ -2605,12 +2290,16 @@ int main(int argc, char **argv) {
         startPolling();
     }
     pthread_t srvT, jpgT, refT;
-    ListenArg *la = malloc(sizeof(ListenArg)); la->lfd = g_httpFd; la->tls = NO;
+    ListenArg *la = malloc(sizeof(ListenArg));
+    la->lfd = g_httpFd;
+    la->tls = NO;
     pthread_create(&srvT, NULL, serverThread, la);
     pthread_detach(srvT);
     if (tfd >= 0) {
         pthread_t tlsT;
-        ListenArg *tla = malloc(sizeof(ListenArg)); tla->lfd = tfd; tla->tls = YES;
+        ListenArg *tla = malloc(sizeof(ListenArg));
+        tla->lfd = tfd;
+        tla->tls = YES;
         pthread_create(&tlsT, NULL, serverThread, tla);
         pthread_detach(tlsT);
     }

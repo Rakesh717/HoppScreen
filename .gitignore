@@ -10,6 +10,7 @@ passwd
 hoppscreen
 keeper
 bench2
+web_index.h
 *.o
 *.dSYM/
 

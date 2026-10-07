@@ -1,3 +1,6 @@
+// VirtualDisplay — ownership and geometry contract for HoppScreen's desktop.
+// Keep the owner alive while capturing; logical points and backing pixels differ
+// on HiDPI displays. The implementation uses the private CGVirtualDisplay API.
 #import <Foundation/Foundation.h>
 
 NS_ASSUME_NONNULL_BEGIN
@@ -27,6 +30,7 @@ NS_ASSUME_NONNULL_BEGIN
            refreshRate:(double)refreshRate
                  error:(NSString *_Nullable *_Nullable)error;
 
+/// Release the live display and reset its ID; safe when already stopped.
 - (void)stop;
 
 @end

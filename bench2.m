@@ -1,5 +1,8 @@
 // bench2.m — diagnose CGDisplayCreateImage cost & whether concurrent requests pipeline.
 // usage: ./bench2 <displayID> [threads] [calls/thread]
+// Defaults: main display, one worker, 60 calls. Each worker records its own
+// per-call latency slice; total wall time reveals whether capture work overlaps.
+// Resolve the header-obsoleted capture API dynamically, as the server does.
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <dlfcn.h>

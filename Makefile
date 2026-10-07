@@ -26,7 +26,7 @@ INPUT   ?= 0
 export HOPPSCREEN_INPUT = $(INPUT)
 
 .DEFAULT_GOAL := help
-.PHONY: help run start stop restart status log build
+.PHONY: help run start stop restart status log build clean
 
 help:
 	@echo "HoppScreen — make <target>"
@@ -37,10 +37,16 @@ help:
 	@echo "  status     running? pid, uptime, /status json, recent log"
 	@echo "  log        follow the server log (ctrl-c to leave)"
 	@echo "  build      compile only (run/start do this automatically)"
+	@echo "  clean      remove the server binary and generated web header"
 	@echo "  vars:      ARGS=\"1680 1050\" pins the display size  AUDIO=1 adds sound  INPUT=1 allows touch control  PORT=8080 (probe)"
 
 # staleness (missing binary / newer sources) is make's own dependency check
-$(BIN): server.m virtualdisplay.m virtualdisplay.h
+# Embed the receiver at build time; the installed binary needs no web directory.
+# xxd names the array web_index_html and provides web_index_html_len (no NUL).
+web_index.h: web/index.html
+	xxd -i web/index.html > $@
+
+$(BIN): server.m virtualdisplay.m virtualdisplay.h web_index.h
 	clang -fobjc-arc -O2 -I. \
 	    -framework Foundation -framework CoreGraphics -framework AppKit \
 	    -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
@@ -48,6 +54,9 @@ $(BIN): server.m virtualdisplay.m virtualdisplay.h
 	    server.m virtualdisplay.m -o $(BIN)
 
 build: $(BIN)
+
+clean:
+	rm -f $(BIN) web_index.h
 
 # foreground mode (certs -> exec the server)
 run: build

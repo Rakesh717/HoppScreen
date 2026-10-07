@@ -1,3 +1,7 @@
+// HoppScreen virtual display owner — private CoreGraphics API adapter.
+// Logical dimensions are points; HiDPI requests a matching 2x framebuffer mode.
+// Creation and mode selection wait for WindowServer's asynchronous teardown/setup;
+// releasing the owned CGVirtualDisplay removes the display.
 #import "virtualdisplay.h"
 #import <CoreGraphics/CoreGraphics.h>
 
@@ -125,7 +129,7 @@
     NSDictionary *modeOpts = @{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES};
     BOOL ok = NO;
     for (int attempt = 0; attempt < 60 && !ok; attempt++) {
-        usleep(150000); // 150ms
+        usleep(150000);
 
         if (_displayID == 0) _displayID = display.displayID;
         if (_displayID == 0) continue;  // not assigned yet
