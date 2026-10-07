@@ -2,7 +2,7 @@
 
 Custom wireless-display stack. The receiver is **any device with a modern
 browser** (Chrome/Edge; tested on an Android tablet) — nothing to install on
-it. The Mac gets a **real virtual display**, streamed as **hardware H.264** to
+it. The Mac gets a **real virtual display**, streamed as **hardware HEVC/H.264** to
 the receiver's browser (WebCodecs) over the LAN, with password protection.
 
 ```
@@ -74,6 +74,22 @@ HOPPSCREEN_SCALE=1 make restart ARGS="1440 900 8080 30"  # 1x pixels: 4x less da
 
 Keep `AUDIO=0` (raw PCM costs ~1.5 Mbps). Stream packets are DSCP AF41-marked,
 so APs that honor WMM queue them as video ahead of bulk traffic.
+
+### Video codecs
+
+`HOPPSCREEN_CODEC=auto` (default) probes WebCodecs before connecting and prefers
+HEVC (H.265) when every connected receiver declares support. An H.264-only or
+legacy receiver makes the shared encoder use H.264; codec switches briefly
+disconnect viewers, which reconnect with a fresh config. Departures alone do
+not switch codecs. `HOPPSCREEN_CODEC=avc make restart` forces H.264;
+`HOPPSCREEN_CODEC=hevc make restart` forces HEVC regardless of receiver support.
+HEVC encoder/config failures automatically fall back to H.264 until restart.
+
+HEVC needs Safari 17+, Chrome on Macs with HEVC decoding, or hardware-decode
+iPads with WebCodecs support, on a secure page. Support depends on device, OS,
+profile/level and browser; the actual stream config is checked too. MJPEG remains
+the last resort when WebCodecs is unavailable. The `/h264` route name is retained:
+both codecs use length-prefixed NALs, with parameter sets in `avcC`/`hvcC` config.
 
 ### Why HTTPS (port 8443)
 

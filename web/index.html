@@ -898,8 +898,45 @@
         },
         { passive: false },
       );
-      async function startH264() {
-        const res = await fetch("/h264", { cache: "no-store" });
+      async function videoConfigSupported(config) {
+        try {
+          return (await VideoDecoder.isConfigSupported(config)).supported;
+        } catch (e) {
+          return false;
+        }
+      }
+      async function probeVideoCodecs() {
+        // Representative Main/High probes discover codec families; the real
+        // description/profile/level is checked again before configuring below.
+        const caps = [];
+        for (const [name, codec] of [
+          ["hvc1", "hvc1.1.6.L153.B0"],
+          ["avc1", "avc1.640034"],
+        ]) {
+          const config = {
+            codec,
+            optimizeForLatency: true,
+            hardwareAcceleration: "prefer-hardware",
+          };
+          let supported = await videoConfigSupported(config);
+          if (!supported) {
+            delete config.hardwareAcceleration;
+            supported = await videoConfigSupported(config);
+          }
+          if (supported) caps.push(name);
+        }
+        console.info("[video] capabilities:", caps.join(","));
+        return caps;
+      }
+      async function startH264(caps) {
+        const disableCodec = (codec) => {
+          const name = codec.startsWith("hvc1") ? "hvc1" : "avc1";
+          const i = caps.indexOf(name);
+          if (i >= 0) caps.splice(i, 1);
+        };
+        const res = await fetch("/h264?c=" + encodeURIComponent(caps.join(",")), {
+          cache: "no-store",
+        });
         if (res.status === 401) {
           location.reload();
           throw new Error("401");
@@ -942,6 +979,9 @@
                 },
                 error: (e) => {
                   console.warn(e);
+                  if (cfg.codec.startsWith("hvc1")) {
+                    disableCodec(cfg.codec); // retry AVC if the real HEVC stream fails
+                  }
                   bad = true;
                   report("&err=" + encodeURIComponent("decoder: " + e.message));
                 },
@@ -952,13 +992,20 @@
                 optimizeForLatency: true,
                 hardwareAcceleration: "prefer-hardware",
               };
-              try {
-                if (!(await VideoDecoder.isConfigSupported(c)).supported)
-                  delete c.hardwareAcceleration;
-              } catch (e) {
+              if (!(await videoConfigSupported(c))) {
                 delete c.hardwareAcceleration;
+                if (!(await videoConfigSupported(c))) {
+                  disableCodec(cfg.codec);
+                  throw new Error("unsupported stream config: " + cfg.codec);
+                }
               }
-              dec.configure(c);
+              try {
+                dec.configure(c);
+              } catch (e) {
+                disableCodec(cfg.codec);
+                throw e;
+              }
+              console.info("[video] configured:", cfg.codec);
               cv.style.display = "block";
               img.style.display = "none";
               cvInfo = info = cfg.w + "x" + cfg.h + " " + cfg.codec + (cfg.arate ? " +audio" : "");
@@ -1050,15 +1097,24 @@
         st.style.display = "block";
         fit();
         if (WC) {
+          const caps = await probeVideoCodecs();
+          if (!caps.length) {
+            startMjpeg();
+            return;
+          }
           mode = "h264";
           while (alive) {
             try {
-              await startH264();
+              await startH264(caps);
             } catch (e) {
               console.warn(e);
               report("&err=" + encodeURIComponent(String((e && e.message) || e)));
             }
             if (!alive) break;
+            if (!caps.length) {
+              startMjpeg();
+              return;
+            }
             await new Promise((r) => setTimeout(r, 500));
           }
         } else startMjpeg();

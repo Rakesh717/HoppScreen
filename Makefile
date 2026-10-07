@@ -18,7 +18,7 @@ ARGS    ?=
 # audio: 1 = stream the Mac's system sound with the video, 0 = silent (default)
 AUDIO   ?= 0
 export HOPPSCREEN_AUDIO = $(AUDIO)
-# h264 bitrate ceiling in Mbps (default: pixel-count formula, max 40). Lower it
+# video bitrate ceiling in Mbps (default: pixel-count formula, max 40). Lower it
 # on slow or shared Wi-Fi, e.g. make restart MBPS=6 ARGS="1200 750 8080 30"
 MBPS    ?=
 export HOPPSCREEN_MBPS = $(MBPS)

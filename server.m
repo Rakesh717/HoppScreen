@@ -2,7 +2,7 @@
  * HoppScreen — macOS virtual display streamed directly to a browser.
  * Private CGVirtualDisplay creates the desktop; capture tries ScreenCaptureKit,
  * then CGDisplayStream, then CGDisplayCreateImage polling. VideoToolbox encodes
- * hardware H.264; JPEG is the browser fallback. System audio requires SCK.
+ * hardware HEVC/H.264; JPEG is the browser fallback. System audio requires SCK.
  *
  * Request routes (shared by HTTP and HTTPS):
  *   /, /index.html  Embedded receiver: WebCodecs H.264 or MJPEG fallback.
@@ -31,6 +31,7 @@
  *   PASSWORD       Nonempty password overrides passwd; accepts any username.
  *   TLS_PORT       HTTPS port; default HTTP+363; 0 disables HTTPS.
  *   LOWLAT         Encoder low-latency mode on unless atoi(value)==0.
+ *   CODEC          auto (default), hevc, or avc; failures fall back to AVC.
  *   NOVUI          Presence disables low-delay SPS/VUI rewriting.
  *   POLL           Presence skips push capture and starts polling directly.
  *   KEEP_PUSH      Presence keeps the watchdog's CGDisplayStream fallback.
@@ -91,7 +92,15 @@ static volatile int g_forceKey = 0; // next encoded frame must be an IDR (new cl
 static volatile uint64_t g_lastSubmitNs = 0; // host time of the last frame handed to the encoder
 static volatile uint64_t g_lastRealNs = 0;   // last frame that came from capture (not a repeat)
 static volatile int g_repeatsSinceReal = 0;
-static NSString *g_codec = nil;        // "avc1.PPCCLL" derived from the real avcC
+static NSString *g_codec = nil; // derived from the real avcC or hvcC
+static BOOL g_hevc = NO, g_hevcFailed = NO;
+static double g_videoBps;
+static BOOL g_videoLowLat;
+static pthread_mutex_t g_encoderLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_negotiationLock = PTHREAD_MUTEX_INITIALIZER;
+static int g_avcOnlyClients = 0;  // includes legacy clients with no capability declaration
+static uint64_t g_codecEpoch = 0; // guarded by g_lock; old streams reconnect on switches
+static void fallbackToAVC(void);
 static dispatch_queue_t g_encQ = NULL; // serializes ALL encoder submits (SC frames + refresh)
 
 static volatile int g_mjpegClients = 0, g_h264Clients = 0;
@@ -116,7 +125,7 @@ typedef struct {
 static AURec g_au[AU_RING];
 static uint64_t g_auHead = 0;      // last written seq (0 = none yet)
 static uint64_t g_auVideoHead = 0; // vseq of the last VIDEO record
-static NSString *g_avcCB64 = nil;  // base64 avcC description
+static NSString *g_avcCB64 = nil;  // base64 codec description (avcC or hvcC)
 static volatile uint64_t g_h264Bytes = 0;
 static volatile uint64_t g_encOutFrames = 0; // AUs emitted by encoder callback
 static volatile double g_encFps = 0;
@@ -560,8 +569,13 @@ static int64_t realtimeUsFromUptimeUs(int64_t upUs) {
 }
 static void vtOutput(void *refCon, void *srcRefCon, OSStatus status, VTEncodeInfoFlags flags,
                      CMSampleBufferRef sb) {
-    if (status != noErr || !sb || !CMSampleBufferIsValid(sb))
+    if (status != noErr || !sb || !CMSampleBufferIsValid(sb)) {
+        if (g_hevc)
+            dispatch_async(g_encQ, ^{
+              fallbackToAVC();
+            });
         return;
+    }
     CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
     if (!bb)
         return;
@@ -589,7 +603,7 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status, VTEncodeInf
     int64_t nowUp = (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000);
     g_encLatMs = g_encLatMs * 0.95 + ((nowUp - upUs) / 1000.0) * 0.05;
     int64_t ptsUs = realtimeUsFromUptimeUs(upUs);
-    if (!getenv("HOPPSCREEN_NOVUI"))
+    if (!g_hevc && !getenv("HOPPSCREEN_NOVUI"))
         data = fixInbandSPS(data);
     len = data.length;
 
@@ -615,8 +629,46 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status, VTEncodeInf
                 exts ? CFDictionaryGetValue(
                            exts, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms)
                      : NULL;
-            CFDataRef avcC = atoms ? CFDictionaryGetValue(atoms, CFSTR("avcC")) : NULL;
-            if (avcC && CFDataGetLength(avcC) >= 4) {
+            CFDataRef avcC =
+                atoms ? CFDictionaryGetValue(atoms, g_hevc ? CFSTR("hvcC") : CFSTR("avcC")) : NULL;
+            if (g_hevc) {
+                // HEVCDecoderConfigurationRecord carries VPS/SPS/PPS out-of-band,
+                // just as avcC does for AVC. AUs retain VT's 4-byte NAL lengths.
+                if (!avcC || CFDataGetLength(avcC) < 23 || (CFDataGetBytePtr(avcC)[21] & 3) != 3) {
+                    dispatch_async(g_encQ, ^{
+                      fallbackToAVC();
+                    });
+                } else {
+                    NSData *d = (__bridge NSData *)avcC;
+                    NSString *b64 = [d base64EncodedStringWithOptions:0];
+                    if (![b64 isEqualToString:g_avcCB64]) {
+                        const uint8_t *a = d.bytes;
+                        // RFC 6381: reverse compatibility flag bits, preserve profile
+                        // space, tier, level and all nonzero constraint indicator bytes.
+                        uint32_t compat = 0;
+                        for (int bit = 0; bit < 32; bit++)
+                            compat |= ((a[2 + bit / 8] >> (7 - bit % 8)) & 1u) << bit;
+                        const char *spaces[] = {"", "A", "B", "C"};
+                        NSMutableString *s = [NSMutableString
+                            stringWithFormat:@"hvc1.%s%u.%X.%c%u", spaces[a[1] >> 6], a[1] & 31,
+                                             compat, (a[1] & 32) ? 'H' : 'L', a[12]];
+                        int last = 11;
+                        while (last >= 6 && !a[last])
+                            last--;
+                        for (int i = 6; i <= last; i++)
+                            [s appendFormat:@".%02X", a[i]];
+                        g_codec = s;
+                        g_avcCB64 = b64;
+                        fprintf(stderr, "[h264] hvcC captured (%zu bytes) codec=%s\n",
+                                (size_t)d.length, s.UTF8String);
+                        fprintf(stderr,
+                                "[h264] encoder ready (%ux%u px, hw, hvc1 Main@%c%.1f, %.0f Mbps, "
+                                "IDR on demand%s)\n",
+                                g_pixW, g_pixH, (a[1] & 32) ? 'H' : 'L', a[12] / 30.0,
+                                g_videoBps / 1e6, g_videoLowLat ? ", low-latency mode" : "");
+                    }
+                }
+            } else if (avcC && CFDataGetLength(avcC) >= 4) {
                 NSData *d = (__bridge NSData *)avcC;
                 NSData *fixed = getenv("HOPPSCREEN_NOVUI") ? nil : fixAvcC(d);
                 static BOOL said = NO;
@@ -637,6 +689,10 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status, VTEncodeInf
                             g_codec.UTF8String);
                 }
             }
+        } else if (g_hevc) {
+            dispatch_async(g_encQ, ^{
+              fallbackToAVC();
+            });
         }
     }
     pthread_cond_broadcast(&g_auCond);
@@ -797,8 +853,11 @@ static uint64_t nowNs(void) {
 
 // single entry point into the encoder (call only on g_encQ or the polling thread)
 static void vtSubmitEx(CVPixelBufferRef pb, BOOL repeat) {
-    if (!g_vts || !pb)
+    pthread_mutex_lock(&g_encoderLock);
+    if (!g_vts || !pb) {
+        pthread_mutex_unlock(&g_encoderLock);
         return;
+    }
     uint64_t t = nowNs();
     static uint64_t lastPts = 0;
     if (t <= lastPts)
@@ -812,12 +871,17 @@ static void vtSubmitEx(CVPixelBufferRef pb, BOOL repeat) {
                                                    (__bridge CFDictionaryRef)props,
                                                    repeat ? (void *)1 : NULL, NULL);
     if (est != noErr) {
+        if (g_hevc)
+            dispatch_async(g_encQ, ^{
+              fallbackToAVC();
+            });
         static int ewarn = 0;
         if (!ewarn++)
             fprintf(stderr, "[h264] EncodeFrame failed: %d\n", (int)est);
     }
     g_lastSubmitNs = t;
     g_encFrames++;
+    pthread_mutex_unlock(&g_encoderLock);
 }
 static void vtSubmit(CVPixelBufferRef pb) {
     vtSubmitEx(pb, NO);
@@ -845,18 +909,18 @@ static BOOL startH264Encoder(void) {
     if (lowLat)
         encSpec[(__bridge NSString *)kVTVideoEncoderSpecification_EnableLowLatencyRateControl] =
             @YES;
-    OSStatus st = VTCompressionSessionCreate(NULL, g_pixW, g_pixH, kCMVideoCodecType_H264,
-                                             (__bridge CFDictionaryRef)encSpec, NULL, NULL,
-                                             vtOutput, NULL, &g_vts);
+    OSStatus st = VTCompressionSessionCreate(
+        NULL, g_pixW, g_pixH, g_hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+        (__bridge CFDictionaryRef)encSpec, NULL, NULL, vtOutput, NULL, &g_vts);
     if (st != noErr && lowLat) {
         fprintf(stderr, "[h264] low-latency encoder unavailable (%d) — using standard mode\n",
                 (int)st);
         lowLat = NO;
         [encSpec removeObjectForKey:(__bridge NSString *)
                                         kVTVideoEncoderSpecification_EnableLowLatencyRateControl];
-        st = VTCompressionSessionCreate(NULL, g_pixW, g_pixH, kCMVideoCodecType_H264,
-                                        (__bridge CFDictionaryRef)encSpec, NULL, NULL, vtOutput,
-                                        NULL, &g_vts);
+        st = VTCompressionSessionCreate(
+            NULL, g_pixW, g_pixH, g_hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+            (__bridge CFDictionaryRef)encSpec, NULL, NULL, vtOutput, NULL, &g_vts);
     }
     if (st != noErr) {
         fprintf(stderr, "[h264] VTCompressionSessionCreate failed: %d\n", (int)st);
@@ -866,9 +930,13 @@ static BOOL startH264Encoder(void) {
     // High profile: ~15-20% better quality/bit than Main -> sharper text at the same rate.
     // Low-latency mode requires the Constrained variant (no B-frames anyway).
     // Level auto-picks 5.1/5.2 for 2880x1800@60 (codec string is derived from the real avcC).
-    OSStatus pst = VTSessionSetProperty(g_vts, kVTCompressionPropertyKey_ProfileLevel,
-                                        lowLat ? kVTProfileLevel_H264_ConstrainedHigh_AutoLevel
-                                               : kVTProfileLevel_H264_High_AutoLevel);
+    OSStatus pst =
+        VTSessionSetProperty(g_vts, kVTCompressionPropertyKey_ProfileLevel,
+                             g_hevc ? kVTProfileLevel_HEVC_Main_AutoLevel
+                                    : (lowLat ? kVTProfileLevel_H264_ConstrainedHigh_AutoLevel
+                                              : kVTProfileLevel_H264_High_AutoLevel));
+    if (pst != noErr && g_hevc)
+        return NO;
     if (pst != noErr)
         VTSessionSetProperty(g_vts, kVTCompressionPropertyKey_ProfileLevel,
                              kVTProfileLevel_H264_High_AutoLevel);
@@ -931,13 +999,75 @@ static BOOL startH264Encoder(void) {
         (__bridge NSString *)kCVPixelBufferCGImageCompatibilityKey : @YES,
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{},
     };
-    CVReturn pr = CVPixelBufferPoolCreate(NULL, (__bridge CFDictionaryRef)poolAttrs,
-                                          (__bridge CFDictionaryRef)pbAttrs, &g_pbPool);
+    CVReturn pr = g_pbPool ? kCVReturnSuccess
+                           : CVPixelBufferPoolCreate(NULL, (__bridge CFDictionaryRef)poolAttrs,
+                                                     (__bridge CFDictionaryRef)pbAttrs, &g_pbPool);
     if (pr != kCVReturnSuccess)
         fprintf(stderr, "[h264] buffer pool create failed: %d (will alloc per-frame)\n", (int)pr);
-    fprintf(stderr, "[h264] encoder ready (%ux%u px, hw, High, %.0f Mbps, IDR on demand%s)\n",
-            g_pixW, g_pixH, bps / 1e6, lowLat ? ", low-latency mode" : "");
+    g_videoBps = bps;
+    g_videoLowLat = lowLat;
+    if (!g_hevc)
+        fprintf(stderr, "[h264] encoder ready (%ux%u px, hw, High, %.0f Mbps, IDR on demand%s)\n",
+                g_pixW, g_pixH, bps / 1e6, lowLat ? ", low-latency mode" : "");
     return YES;
+}
+
+// Called under the negotiation lock. Submission is excluded even on the polling
+// capture path; complete callbacks before changing codec or clearing its config.
+static BOOL switchVideoCodec(BOOL hevc) {
+    pthread_mutex_lock(&g_encoderLock);
+    if (g_vts) {
+        VTCompressionSessionCompleteFrames(g_vts, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(g_vts);
+        CFRelease(g_vts);
+        g_vts = NULL;
+    }
+    pthread_mutex_lock(&g_lock);
+    g_hevc = hevc;
+    g_codec = nil;
+    g_avcCB64 = nil;
+    g_codecEpoch++;
+    pthread_cond_broadcast(&g_auCond);
+    pthread_mutex_unlock(&g_lock);
+    BOOL ok = startH264Encoder();
+    pthread_mutex_unlock(&g_encoderLock);
+    if (!ok && hevc) {
+        g_hevcFailed = YES;
+        fprintf(stderr, "[h264] HEVC encoder setup failed — falling back to H.264\n");
+        return switchVideoCodec(NO);
+    }
+    g_forceKey = 1;
+    return ok;
+}
+
+static void fallbackToAVC(void) {
+    pthread_mutex_lock(&g_negotiationLock);
+    if (g_hevc) {
+        g_hevcFailed = YES; // don't repeatedly retry a broken encoder on reconnect
+        fprintf(stderr, "[h264] HEVC output/config failed — falling back to H.264\n");
+        switchVideoCodec(NO);
+    }
+    pthread_mutex_unlock(&g_negotiationLock);
+}
+
+static BOOL wantsHEVC(void) {
+    const char *codec = getenv("HOPPSCREEN_CODEC");
+    if (codec && strcmp(codec, "avc") == 0)
+        return NO;
+    if (codec && strcmp(codec, "hevc") == 0)
+        return !g_hevcFailed;
+    // Single global encoder: intersection of active receivers. Legacy + new
+    // clients means H.264 wins. Only a NEW connection can trigger an upgrade;
+    // departures alone never restart the encoder and disrupt remaining viewers.
+    return !g_hevcFailed && g_h264Clients > 0 && g_avcOnlyClients == 0;
+}
+
+static void unregisterVideoClient(BOOL hevcCapable) {
+    pthread_mutex_lock(&g_negotiationLock);
+    if (!hevcCapable)
+        g_avcOnlyClients--;
+    __sync_fetch_and_sub(&g_h264Clients, 1);
+    pthread_mutex_unlock(&g_negotiationLock);
 }
 
 static void drawCursorOverlay(CGContextRef ctx);
@@ -2266,13 +2396,28 @@ static void handleClient(int fd, BOOL tls) {
             fprintf(stderr, "[stream] mjpeg client done (%d frames)\n", sent);
             __sync_fetch_and_sub(&g_mjpegClients, 1);
         } else if (strcmp(path, "/h264") == 0) {
+            NSString *capabilities = nil;
+            for (NSString *part in
+                 [[NSString stringWithUTF8String:query] componentsSeparatedByString:@"&"])
+                if ([part hasPrefix:@"c="])
+                    capabilities = [[part substringFromIndex:2] stringByRemovingPercentEncoding];
+            BOOL hevcCapable =
+                [[capabilities componentsSeparatedByString:@","] containsObject:@"hvc1"];
+            pthread_mutex_lock(&g_negotiationLock);
+            if (!hevcCapable)
+                g_avcOnlyClients++;
             __sync_fetch_and_add(&g_h264Clients, 1); // also wakes the encoder if idle
+            BOOL desired = wantsHEVC();
+            if (desired != g_hevc)
+                switchVideoCodec(desired);
+            pthread_mutex_unlock(&g_negotiationLock);
             // watermark FIRST, then request the IDR: if the keyframe is encoded
             // before waitAfter is sampled, the priming scan below would skip it
             // and a static screen could stay black until the next periodic IDR
-            uint64_t waitAfter;
+            uint64_t waitAfter, epoch;
             pthread_mutex_lock(&g_lock);
             waitAfter = g_auHead;
+            epoch = g_codecEpoch;
             pthread_mutex_unlock(&g_lock);
             g_forceKey = 1;
             NSString *codec = nil, *desc = nil;
@@ -2280,14 +2425,19 @@ static void handleClient(int fd, BOOL tls) {
                 pthread_mutex_lock(&g_lock);
                 codec = g_codec;
                 desc = g_avcCB64;
+                BOOL changed = epoch != g_codecEpoch;
                 pthread_mutex_unlock(&g_lock);
+                if (changed) {
+                    desc = nil;
+                    break;
+                }
                 if (desc)
                     break;
                 usleep(50000);
             }
             if (!desc) {
                 writeStr(fd, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
-                __sync_fetch_and_sub(&g_h264Clients, 1);
+                unregisterVideoClient(hevcCapable);
                 closeConn(fd);
                 return;
             }
@@ -2307,7 +2457,7 @@ static void handleClient(int fd, BOOL tls) {
             if (!writeStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
                               "Cache-Control: no-store\r\nConnection: close\r\n\r\n") ||
                 !writeAll(fd, cl, 4) || !writeAll(fd, cfgData.bytes, cfgData.length)) {
-                __sync_fetch_and_sub(&g_h264Clients, 1);
+                unregisterVideoClient(hevcCapable);
                 closeConn(fd);
                 return;
             }
@@ -2326,6 +2476,10 @@ static void handleClient(int fd, BOOL tls) {
                 @autoreleasepool {
                     int cnt = 0;
                     pthread_mutex_lock(&g_lock);
+                    if (epoch != g_codecEpoch) {
+                        pthread_mutex_unlock(&g_lock);
+                        break; // old config must never be used for the new codec
+                    }
                     if (!primed) {
                         for (uint64_t s = waitAfter + 1; s <= g_auHead; s++) {
                             AURec *r = &g_au[s % AU_RING];
@@ -2387,7 +2541,7 @@ static void handleClient(int fd, BOOL tls) {
                 }
             }
             fprintf(stderr, "[stream] h264 client done (%d AUs, %d lag resyncs)\n", sent, resyncs);
-            __sync_fetch_and_sub(&g_h264Clients, 1);
+            unregisterVideoClient(hevcCapable);
         } else if (strcmp(path, "/input/toggle") == 0) {
             // presenter mode: flip input acceptance at runtime. HARD GATE: only
             // works when the server booted with INPUT=1 — a boot-disabled server
@@ -2798,7 +2952,7 @@ int main(int argc, char **argv) {
         } else
             fprintf(stderr, "[input] touch input ready (accessibility granted)\n");
     }
-    if (!startH264Encoder())
+    if (!switchVideoCodec(wantsHEVC()))
         fprintf(stderr, "continuing without h264 (mjpeg only)\n");
 
     // resolve next to the binary, not the caller's cwd (g_exePath is absolute,
