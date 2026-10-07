@@ -2092,8 +2092,8 @@ static void ensureDisplayActive(void) {
     IOPMAssertionID aid = 0;
     // "UserIsActive" is the assertion type behind `caffeinate -u` (no public constant)
     if (IOPMAssertionCreateWithName(CFSTR("UserIsActive"), kIOPMAssertionLevelOn,
-                                    CFSTR("HoppScreen virtual display wake"), &aid) ==
-        kIOReturnSuccess) {
+                                    CFSTR("HoppScreen virtual display wake"),
+                                    &aid) == kIOReturnSuccess) {
         fprintf(stderr, "[input] virtual display #%u inactive — waking it\n", g_displayID);
         usleep(1200000); // WindowServer needs a beat to re-activate the display
         IOPMAssertionRelease(aid);
@@ -2648,9 +2648,9 @@ static void handleClient(int fd, BOOL tls) {
                         }
                         if (g_inputTrusted)
                             ensureDisplayActive(); // pointer needs an active display to land on
-                            dispatch_async(g_inputQ, ^{
-                              applyInputEvent(ev);
-                            }); // serial: keeps order
+                        dispatch_async(g_inputQ, ^{
+                          applyInputEvent(ev);
+                        }); // serial: keeps order
                         writeStr(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
                     }
                 }
