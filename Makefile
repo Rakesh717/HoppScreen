@@ -54,6 +54,8 @@ run: build
 	@./certs.sh || echo "warning: certificate setup failed — HTTPS disabled"
 	@exec ./$(BIN) $(ARGS)
 
+# staleness (missing binary / newer sources) is make's own dependency check
+# and guards this background start (see $(BIN) rule above)
 start: build
 	@if [ -f $(PIDFILE) ] && kill -0 $$(cat $(PIDFILE)) 2>/dev/null; then \
 	    echo "already running (pid $$(cat $(PIDFILE))) — try: make restart"; exit 0; fi

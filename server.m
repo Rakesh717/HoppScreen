@@ -2430,6 +2430,13 @@ int main(int argc, char **argv) {
     uint32_t h = argc > 2 ? (uint32_t)atoi(argv[2]) : 900;
     uint16_t port = argc > 3 ? (uint16_t)atoi(argv[3]) : 8080;
     g_fps = argc > 4 ? atof(argv[4]) : 120.0;   // high-hz panels: 120 halves per-frame latency
+    // env fallbacks: a launcher can set port/fps WITHOUT pinning
+    // the size — positional args would disable auto-fit. Positional args win.
+    if (argc <= 3) { const char *e = getenv("HOPPSCREEN_PORT");
+        if (e && atoi(e) > 0 && atoi(e) < 65536) port = (uint16_t)atoi(e); }
+    if (argc <= 4) { const char *e = getenv("HOPPSCREEN_FPS");
+        double f = e ? atof(e) : 0;
+        if (isfinite(f) && f >= 1 && f <= 120) g_fps = f; }
     BOOL hiDPI = !(getenv("HOPPSCREEN_SCALE") && atoi(getenv("HOPPSCREEN_SCALE")) == 1);
     if (!w || !h || !port || w < 500 || h < 500 || w > 3840 || h > 2400 ||
         !isfinite(g_fps) || g_fps < 1 || g_fps > 120) {   // atof("nan") would pass < and > checks
