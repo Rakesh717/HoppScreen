@@ -46,6 +46,28 @@ rtc-deps:
 $(RTC_BUILD)/lib/libdatachannel.a:
 	$(MAKE) rtc-deps
 
+rtc_web.h: web/rtc-test.html
+	xxd -i web/rtc-test.html > $@
+
+hoppscreen-rtc: server.m virtualdisplay.m virtualdisplay.h web_index.h rtc_web.h rtc_transport.cpp rtc_transport.h rtc_packetizer.h $(RTC_BUILD)/lib/libdatachannel.a
+	clang -fobjc-arc -O2 -I. -DHOPP_RTC -c server.m -o $(RTC_BUILD)/server.o
+	clang -fobjc-arc -O2 -I. -c virtualdisplay.m -o $(RTC_BUILD)/virtualdisplay.o
+	clang++ -std=c++17 -O2 -Ivendor/libdatachannel/include -DRTC_STATIC -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=0 -c rtc_transport.cpp -o $(RTC_BUILD)/transport.o
+	clang++ $(RTC_BUILD)/server.o $(RTC_BUILD)/virtualdisplay.o $(RTC_BUILD)/transport.o \
+	    $(RTC_BUILD)/lib/libdatachannel.a $(RTC_BUILD)/lib/deps/libjuice/libjuice.a \
+	    $(RTC_BUILD)/lib/deps/libsrtp/libsrtp2.a $(RTC_BUILD)/lib/deps/usrsctp/usrsctplib/libusrsctp.a \
+	    -L$(OPENSSL_ROOT)/lib -lssl -lcrypto \
+	    -framework Foundation -framework CoreGraphics -framework AppKit \
+	    -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+	    -framework ScreenCaptureKit -framework IOSurface -framework Security -o $@
+
+rtc: hoppscreen-rtc
+
+rtc-test:
+	@mkdir -p $(RTC_BUILD)
+	clang++ -std=c++17 rtc_packetizer_test.cpp -o $(RTC_BUILD)/packetizer-test
+	$(RTC_BUILD)/packetizer-test
+
 # formatters: .clang-format for C/ObjC (falls back to Xcode's toolchain copy),
 # prettier for the receiver page. format-check fails if anything is unformatted.
 CLANG_FORMAT ?= $(shell command -v clang-format 2>/dev/null || echo "xcrun clang-format")

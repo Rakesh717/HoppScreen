@@ -73,6 +73,10 @@
 #import <mach-o/dyld.h>
 #import "virtualdisplay.h"
 #include "web_index.h"
+#ifdef HOPP_RTC
+#include "rtc_transport.h"
+#include "rtc_web.h"
+#endif
 
 // ============================================================ shared state
 // Display geometry, capture snapshots and stream publications shared by workers.
@@ -696,7 +700,13 @@ static void vtOutput(void *refCon, void *srcRefCon, OSStatus status, VTEncodeInf
         }
     }
     pthread_cond_broadcast(&g_auCond);
+#ifdef HOPP_RTC
+    NSData *rtcConfig = [[NSData alloc] initWithBase64EncodedString:g_avcCB64 ?: @"" options:0];
+#endif
     pthread_mutex_unlock(&g_lock);
+#ifdef HOPP_RTC
+    hopp_rtc_frame(data.bytes, data.length, rtcConfig.bytes, rtcConfig.length, ptsUs, isKey);
+#endif
 }
 
 // ============================================================ audio (system sound -> ring)
@@ -2226,6 +2236,48 @@ static void applyInputEvent(NSDictionary *ev) {
 // One bounded request per connection, authenticated before route dispatch.
 // H.264 starts on a fresh IDR and drops ~250ms backlogs rather than accumulating delay.
 // JSON-only mutation routes and a shared listener budget bound receiver-side work.
+#ifdef HOPP_RTC
+static void rtcRequestKeyframe(void) {
+    __sync_lock_test_and_set(&g_forceKey, 1);
+}
+
+static void rtcOfferHTTP(int fd, const char *req, ssize_t n) {
+    char length[32] = {0}, type[128] = {0};
+    headerVal(req, "Content-Length", length, sizeof length);
+    headerVal(req, "Content-Type", type, sizeof type);
+    long count = strtol(length, NULL, 10);
+    NSDictionary *result = nil;
+    bool ok = false;
+    if (count > 0 && count <= 65536 && strncmp(type, "application/json", 16) == 0) {
+        const char *start = strstr(req, "\r\n\r\n") + 4;
+        size_t present = (size_t)n - (size_t)(start - req);
+        NSMutableData *body = [NSMutableData dataWithLength:(NSUInteger)count];
+        size_t used = MIN(present, (size_t)count);
+        memcpy(body.mutableBytes, start, used);
+        while (used < (size_t)count) {
+            ssize_t r = connRecv(fd, (char *)body.mutableBytes + used, (size_t)count - used);
+            if (r <= 0)
+                break;
+            used += (size_t)r;
+        }
+        id json = used == (size_t)count ? [NSJSONSerialization JSONObjectWithData:body options:0 error:nil] : nil;
+        if ([json isKindOfClass:[NSDictionary class]] && [json[@"sdp"] isKindOfClass:[NSString class]] &&
+            [json[@"type"] isEqual:@"offer"]) {
+            char *answer = hopp_rtc_offer([json[@"sdp"] UTF8String], rtcRequestKeyframe, &ok);
+            NSString *text = answer ? [NSString stringWithUTF8String:answer] : @"allocation failed";
+            result = ok ? @{@"type": @"answer", @"sdp": text} : @{@"error": text};
+            free(answer);
+        }
+    }
+    NSData *body = [NSJSONSerialization dataWithJSONObject:result ?: @{@"error": @"bounded JSON offer required"}
+                                                 options:0 error:nil];
+    char hdr[256];
+    snprintf(hdr, sizeof hdr, "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
+             "Cache-Control: no-store\r\nConnection: close\r\n\r\n", ok ? "200 OK" : "400 Bad Request", (size_t)body.length);
+    writeStr(fd, hdr);
+    writeAll(fd, body.bytes, body.length);
+}
+#endif
 static void handleClient(int fd, BOOL tls) {
     @autoreleasepool {
         if (tls && !tlsAccept(fd)) {
@@ -2291,6 +2343,28 @@ static void handleClient(int fd, BOOL tls) {
             return;
         }
 
+#ifdef HOPP_RTC
+        if (strcmp(path, "/rtc/offer") == 0 && strcmp(method, "POST") == 0) {
+            rtcOfferHTTP(fd, req, n);
+            closeConn(fd);
+            return;
+        }
+        if ((strcmp(path, "/") == 0 || strcmp(path, "/rtc-test.html") == 0) && strcmp(method, "GET") == 0) {
+            char hdr[256];
+            snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %u\r\n"
+                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n", web_rtc_test_html_len);
+            writeStr(fd, hdr);
+            writeAll(fd, (const char *)web_rtc_test_html, web_rtc_test_html_len);
+            closeConn(fd);
+            return;
+        }
+        // The spike is video-only; do not expose legacy input/audio/refit mutation routes.
+        if (strcmp(path, "/ca.crt") != 0 && strcmp(path, "/status") != 0 && strcmp(path, "/time") != 0) {
+            writeStr(fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            closeConn(fd);
+            return;
+        }
+#endif
         if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
             char hdr[256];
             snprintf(hdr, sizeof(hdr),
@@ -2842,6 +2916,16 @@ static void onSig(int sig) {
 }
 
 int main(int argc, char **argv) {
+#ifdef HOPP_RTC
+    // Isolated prototype defaults. Encoder/capture implementations remain shared.
+    setenv("HOPPSCREEN_CODEC", "avc", 1);
+    setenv("HOPPSCREEN_AUDIO", "0", 1);
+    setenv("HOPPSCREEN_INPUT", "0", 1);
+    if (!getenv("HOPPSCREEN_PORT"))
+        setenv("HOPPSCREEN_PORT", "8090", 1);
+    if (!getenv("HOPPSCREEN_TLS_PORT"))
+        setenv("HOPPSCREEN_TLS_PORT", "8450", 1);
+#endif
     // args are the LOGICAL ("looks like") size in points; the framebuffer is 2x that
     // (Retina) unless HOPPSCREEN_SCALE=1. Default 1440x900 pt = 2880x1800 px. With no
     // size args, auto-fit can recreate the display to match the first client.
